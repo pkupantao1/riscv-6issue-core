@@ -1,0 +1,67 @@
+# 必达 bin 清单 (docs/13_verification_plan.md §5.3)：urg 合并全部用例后检查，scripts/musthit.py 读取
+#   列：covergroup  coverpoint  bin 名  阶段  说明
+#   阶段 V1 = 现在强制 (未中即回归失败)；P1 = 补齐计划里的项，未中只报告「待补」
+# 资源满
+cg_uarch  cp_DS_ROB       hit     V1  ROB 满 (分派停顿)
+cg_uarch  cp_iq_a         full    V1  IQ_A 满
+cg_uarch  cp_iq_b         full    V1  IQ_B 满
+cg_uarch  cp_iq_m         full    V1  IQ_M 满
+cg_uarch  cp_iq_n         full    V1  IQ_N 满
+cg_uarch  cp_iq_f         full    V1  IQ_F 满
+cg_uarch  cp_iq_s         full    V1  IQ_S 满
+cg_uarch  cp_iq_d         full    V1  IQ_D 满
+cg_uarch  cp_iq_c         full    V1  IQ_C 满
+cg_uarch  cp_DS_LQ        hit     V1  LQ 满 (分派停顿)
+cg_uarch  cp_SQ_FULL      hit     V1  SQ 所有项有效
+cg_uarch  cp_LQ_FULL      hit     P1  LQ 所有项有效 (128 项)
+cg_uarch  cp_SQFULL_FLUSH hit     V1  SQ 满时冲刷 (#26 类；sq_flush.S)
+cg_uarch  cp_DS_SQ        hit     V1  SQ 满
+cg_uarch  cp_FTQ_FULL     hit     V1  FTQ 满
+cg_uarch  cp_MSHR_FULL    hit     V1  MSHR 全忙
+cg_uarch  cp_RN_IFL       hit     V1  整数空闲寄存器不够
+cg_uarch  cp_RN_FFL       hit     V1  浮点空闲寄存器不够
+cg_uarch  cp_RN_TAG       hit     V1  分支标签用尽
+# 冲刷
+cg_uarch  cp_FL_REPLAY    hit     V1  重放冲刷
+cg_uarch  cp_FL_TRAP      hit     V1  陷入 / 中断冲刷
+cg_uarch  cp_FL_AFTER     hit     V1  flush_after
+cg_uarch  cx_mis_dmiss    hit     V1  分支重定向与 D$ load 缺失同拍
+# 预测
+cg_uarch  cp_MIS_COND     hit     V1  条件分支误预测
+cg_uarch  cp_MIS_COND_TK  hit     V1  条件分支误预测 (实际跳)
+cg_uarch  cp_MIS_RET      hit     V1  返回误预测
+cg_uarch  cp_MIS_IND      hit     V1  间接跳转误预测
+cg_uarch  cp_F1_BTB       hit     V1  F1 BTB 改道
+cg_uarch  cp_F3_OVR       hit     V1  F3 覆盖
+# 访存
+cg_uarch  cp_STFWD        hit     V1  store->load 全覆盖转发
+cg_uarch  cp_STFWD_WAIT   hit     V1  部分覆盖等待
+cg_uarch  cp_VIOL         hit     V1  访存违例
+cg_uarch  cp_LD_FAIL      hit     V1  投机唤醒失败
+cg_uarch  cp_DC_LD_MISS   hit     V1  D$ load 缺失
+cg_uarch  cp_DC_ST_MISS   hit     V1  D$ store 缺失
+cg_uarch  cp_MMIO         hit     V1  MMIO 访问
+cg_uarch  cx_viol_mshr    hit     V1  违例重放与 MSHR 全忙同拍 (viol_mshr.S)
+# 陷入 / 中断
+cg_trap   cp_irq          mei     V1  机器外部中断
+cg_trap   cp_irq          sei     V1  监管外部中断
+cg_trap   cp_irq          mti     V1  机器定时器中断 (CLINT 代理，irq_tmr)
+cg_trap   cp_irq          msi     V1  机器软件中断
+cg_trap   cp_irq          sti     V1  监管定时器中断 (M 态转发 STIP)
+cg_trap   cp_irq          ssi     V1  监管软件中断
+cg_trap   cp_last         C_LD    V1  中断打在 load 之后
+cg_trap   cp_last         C_ST    V1  中断打在 store 之后
+cg_trap   cp_last         C_BR    V1  中断打在分支之后
+cg_trap   cp_last         C_DIV   V1  中断打在除法之后
+cg_trap   cp_last         C_CSR   V1  中断打在 CSR 指令之后
+cg_trap   cp_last         C_FPU   V1  中断打在浮点运算之后
+cg_trap   cp_exc          ld_pf   V1  load 缺页
+cg_trap   cp_exc          st_pf   V1  store 缺页
+cg_trap   cp_exc          i_pf    V1  取指缺页
+cg_irq_drv cp_kind        both    V1  MEIP / SEIP 同时置位
+cg_irq_drv cp_delay       b2b     V1  连发注入 (间隔 1~3 拍)
+# 向量
+cg_vmem   cp_mop          unit    V1  单位步长访存
+cg_vmem   cp_mop          strided V1  跨步访存
+cg_vmem   cp_mop          idx_u   V1  无序索引访存 (vgen midx)
+cg_vmem   cp_mop          idx_o   V1  有序索引访存 (vgen midx)

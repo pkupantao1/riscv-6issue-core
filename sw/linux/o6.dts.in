@@ -1,0 +1,85 @@
+// o6.dts.in - OOO6 SoC 设备树模板 (scripts/build_linux.sh 替换 @CLK@ / @TB@ / @MEMSZ@ / @BOOTARGS@)
+//   地址映射与 rtl/soc/o6_soc.sv 一致 (与 QEMU virt 相同)：
+//   CLINT 0x0200_0000、PLIC 0x0C00_0000 (源 1 = UART，上下文 0 = M、1 = S)、16550 UART 0x1000_0000、DRAM 0x8000_0000
+//   只声明核真正实现的扩展：RV64GC + Zicsr/Zifencei/Zicntr/Zihpm，Sv39；没有 Svadu (A/D 位由软件置)、
+//   Sstc、Svpbmt、Svnapot、V
+/dts-v1/;
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+	compatible = "o6,ooo6-soc";
+	model = "OOO6 RV64GC SoC";
+
+	chosen {
+		bootargs = "@BOOTARGS@";
+		stdout-path = "/soc/serial@10000000";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		timebase-frequency = <@TB@>;
+
+		cpu0: cpu@0 {
+			device_type = "cpu";
+			reg = <0>;
+			status = "okay";
+			compatible = "o6,ooo6", "riscv";
+			riscv,isa = "rv64imafdc_zicsr_zifencei_zicntr_zihpm_zba_zbb_zbs_zicond_zawrs_zfa_sstc_svinval_svnapot";
+			riscv,isa-base = "rv64i";
+			riscv,isa-extensions = "i", "m", "a", "f", "d", "c", "zicsr", "zifencei", "zicntr", "zihpm",
+			                       "zba", "zbb", "zbs", "zicond", "zawrs", "zfa", "sstc", "svinval", "svnapot";
+			mmu-type = "riscv,sv57";               /* RVA23 R4：内核按 Sv57 -> Sv48 -> Sv39 探测 satp */
+			clock-frequency = <@CLK@>;
+			i-cache-size = <32768>;
+			d-cache-size = <32768>;
+
+			cpu0_intc: interrupt-controller {
+				#interrupt-cells = <1>;
+				#address-cells = <0>;
+				interrupt-controller;
+				compatible = "riscv,cpu-intc";
+			};
+		};
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 @MEMSZ@>;
+	};
+
+	soc {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		compatible = "simple-bus";
+		ranges;
+
+		clint@2000000 {
+			compatible = "sifive,clint0", "riscv,clint0";
+			reg = <0x0 0x2000000 0x0 0x10000>;
+			interrupts-extended = <&cpu0_intc 3>, <&cpu0_intc 7>;
+		};
+
+		plic: interrupt-controller@c000000 {
+			compatible = "sifive,plic-1.0.0", "riscv,plic0";
+			reg = <0x0 0xc000000 0x0 0x4000000>;
+			#address-cells = <0>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			interrupts-extended = <&cpu0_intc 11>, <&cpu0_intc 9>;
+			riscv,ndev = <31>;
+		};
+
+		serial@10000000 {
+			compatible = "ns16550a";
+			reg = <0x0 0x10000000 0x0 0x1000>;
+			reg-shift = <0>;
+			reg-io-width = <1>;
+			clock-frequency = <@CLK@>;
+			current-speed = <115200>;
+			interrupt-parent = <&plic>;
+			interrupts = <1>;
+		};
+	};
+};

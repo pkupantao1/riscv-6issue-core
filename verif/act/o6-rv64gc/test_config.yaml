@@ -1,0 +1,7 @@
+name: o6-rv64gc
+compiler_exe: /export/master/rvtools/bin/riscv64-unknown-elf-gcc
+objdump_exe: /export/master/rvtools/bin/riscv64-unknown-elf-objdump
+ref_model_exe: /home/master/tools/sail/bin/sail_riscv_sim
+udb_config: o6-rv64gc.yaml
+linker_script: link.ld
+dut_include_dir: .

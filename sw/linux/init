@@ -1,0 +1,15 @@
+#!/bin/sh
+# OOO6 initramfs 的 /init：挂载伪文件系统，打一行启动标记 (仿真 / FPGA 脚本据此判断起到了用户态)，再起 shell
+mount -t proc     none /proc
+mount -t sysfs    none /sys
+mount -t devtmpfs none /dev 2>/dev/null
+mount -t tmpfs    none /tmp
+echo "OOO6-LINUX-USERSPACE-OK"
+cat /proc/cpuinfo
+uname -a
+# 仿真里 (内核命令行带 o6sim) 跑完自检就关机，FPGA 上进交互 shell
+if grep -q o6sim /proc/cmdline; then
+  echo "OOO6-LINUX-DONE"
+  poweroff -f
+fi
+exec setsid cttyhack /bin/sh

@@ -1,0 +1,23 @@
+# 仿真 / 综合产物
+work/
+run/
+build/
+csrc/
+simv*
+*.daidir
+*.fsdb
+*.vcd
+*.wdb
+*.log
+*.jou
+*.pb
+.Xil/
+xsim.dir/
+obj_dir/
+__pycache__/
+*.pyc
+ucli.key
+DVEfiles/
+verdiLog/
+novas*
+third_party/cvfpu/tb/

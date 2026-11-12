@@ -1,0 +1,181 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/riscv/riscv-unified-db/main/spec/schemas/config_schema.json
+# OOO6 (core 模式 tb_top) 的 riscv-arch-test (ACT4) UDB 配置：只列实际实现的扩展与参数
+#   以 config/cores/cvw/cvw-rv64gc 为模板；与 O6 不同之处见各参数注释 (依据 rtl/csr/o6_csr.sv、rtl/lsu/o6_lsu.sv、docs/01 §7/§8)
+#   向量 (V，VLEN = 1024) 暂不列入：ACT 的向量测试另行接入
+---
+$schema: config_schema.json#
+kind: architecture configuration
+type: fully configured
+name: o6-rv64gc
+description: OOO6 6-issue out-of-order RV64GC+B (Sv39/48/57, Svnapot, Svpbmt, PMP x8, Svade)
+implemented_extensions:
+  - { name: I, version: "= 2.1" }
+  - { name: A, version: "= 2.1.0" }
+  - { name: M, version: "= 2.0" }
+  - { name: F, version: "= 2.2.0" }
+  - { name: D, version: "= 2.2.0" }
+  - { name: C, version: "= 2.0" }
+  - { name: B, version: "= 1.0.0" }
+  - { name: Zicntr, version: "= 2.0" }
+  - { name: Zicsr, version: "= 2.0" }
+  - { name: Zifencei, version: "= 2.0.0" }
+  - { name: Zihintntl, version: "= 1.0.0" }
+  - { name: Zihintpause, version: "= 2.0.0" }
+  - { name: Zihpm, version: "= 2.0.0" }
+  - { name: Zmmul, version: "= 1.0.0" }
+  - { name: Zaamo, version: "= 1.0.0" }
+  - { name: Zalrsc, version: "= 1.0.0" }
+  - { name: Zfhmin, version: "= 1.0.0" }
+  - { name: Zca, version: "= 1.0.0" }
+  - { name: Zcd, version: "= 1.0.0" }
+  - { name: Zba, version: "= 1.0.0" }
+  - { name: Zbb, version: "= 1.0.0" }
+  - { name: Zbs, version: "= 1.0.0" }
+  # RVA23 R1 (2026-10-29，docs/14)
+  - { name: Zicond, version: "= 1.0.0" }
+  - { name: Zcb, version: "= 1.0.0" }
+  - { name: Zimop, version: "= 1.0.0" }
+  - { name: Zcmop, version: "= 1.0.0" }
+  - { name: Zawrs, version: "= 1.0.0" }
+  # RVA23 R2
+  - { name: Zicbom, version: "= 1.0.0" }
+  - { name: Zicboz, version: "= 1.0.0" }
+  - { name: Zicbop, version: "= 1.0.0" }
+  - { name: Zic64b, version: "= 1.0.0" }
+  - { name: Zfa, version: "= 1.0.0" }
+  - { name: U, version: "= 1.0.0" }
+  - { name: S, version: "= 1.12.0" }
+  - { name: Sv39, version: "= 1.0.0" }
+  # RVA23 R4 (docs/14)
+  - { name: Sv48, version: "= 1.0" }
+  - { name: Sv57, version: "= 1.0" }
+  - { name: Svnapot, version: "= 1.0.0" }
+  - { name: Svpbmt, version: "= 1.0.0" }
+  - { name: Svinval, version: "= 1.0.0" }
+  # RVA23 R3：Smstateen / Ssstateen (mstateen0.ENVCFG 门控 senvcfg：ACT 框架据此先打开)
+  - { name: Smstateen, version: "= 1.0.0" }
+  - { name: Ssstateen, version: "= 1.0.0" }
+  - { name: Svade, version: "= 1.0.0" }   # A/D = 0 报缺页，硬件不置位 (无 Svadu)
+  - { name: Svbare, version: "= 1.0.0" }
+  - { name: Sm, version: "= 1.12.0" }
+
+params:
+  NON_STANDARD_EXTENSION_IMPLEMENTED: false
+  # A
+  MISALIGNED_AMO: false
+  LRSC_RESERVATION_STRATEGY: "reserve exactly enough to cover the access"   # 保留集 = LR 的精确地址 (#17)
+  LRSC_FAIL_ON_VA_SYNONYM: false
+  LRSC_MISALIGNED_BEHAVIOR: "always raise misaligned exception"
+  LRSC_FAIL_ON_NON_EXACT_LRSC: false
+  MUTABLE_MISA_A: false
+  # M / F / D / C / B (misa 只读)
+  MUTABLE_MISA_M: false
+  MUTABLE_MISA_F: false
+  HW_MSTATUS_FS_DIRTY_UPDATE: precise
+  MSTATUS_FS_LEGAL_VALUES: [0, 1, 2, 3]
+  MUTABLE_MISA_D: false
+  MUTABLE_MISA_C: false
+  MUTABLE_MISA_B: false
+  # Zicntr
+  TIME_CSR_IMPLEMENTED: true
+  # Zawrs：wrs.nto 立即结束 (只做 TW 检查)
+  ZAWRS_NTO_IS_NOP: true
+  # Zicbom / Zicboz / Zic64b：缓存块 64 B
+  CACHE_BLOCK_SIZE: 64
+  FORCE_UPGRADE_CBO_INVAL_TO_FLUSH: true    # cbo.inval 一律按 flush 做 (docs/14 R2a)
+  # Smstateen
+  MSTATEEN_ENVCFG_TYPE: rw
+  # U
+  WFI_U_MODE: true
+  MUTABLE_MISA_U: false
+  U_MODE_ENDIANNESS: little
+  UXLEN: [64]
+  TRAP_ON_ECALL_FROM_U: true
+  # S
+  SEI_INTR_IMPL: true
+  SSI_INTR_IMPL: true
+  STI_INTR_IMPL: true
+  MUTABLE_MISA_S: false
+  ASID_WIDTH: 16
+  S_MODE_ENDIANNESS: little
+  SXLEN: [64]
+  REPORT_VA_IN_MTVAL_ON_LOAD_PAGE_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_STORE_AMO_PAGE_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_PAGE_FAULT: true
+  REPORT_VA_IN_STVAL_ON_BREAKPOINT: true
+  REPORT_VA_IN_STVAL_ON_LOAD_MISALIGNED: true
+  REPORT_VA_IN_STVAL_ON_STORE_AMO_MISALIGNED: true
+  REPORT_VA_IN_STVAL_ON_INSTRUCTION_MISALIGNED: true
+  REPORT_VA_IN_STVAL_ON_LOAD_ACCESS_FAULT: true
+  REPORT_VA_IN_STVAL_ON_STORE_AMO_ACCESS_FAULT: true
+  REPORT_VA_IN_STVAL_ON_INSTRUCTION_ACCESS_FAULT: true
+  REPORT_VA_IN_STVAL_ON_LOAD_PAGE_FAULT: true
+  REPORT_VA_IN_STVAL_ON_STORE_AMO_PAGE_FAULT: true
+  REPORT_VA_IN_STVAL_ON_INSTRUCTION_PAGE_FAULT: true
+  REPORT_ENCODING_IN_STVAL_ON_ILLEGAL_INSTRUCTION: true
+  STVAL_WIDTH: 64
+  SCOUNTENABLE_EN: [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]
+  STVEC_MODES: [0, 1]
+  STVEC_BASE_ALIGNMENT_VECTORED: 4
+  SATP_MODE_BARE: true
+  TRAP_ON_ECALL_FROM_S: true
+  MSTATUS_VS_LEGAL_VALUES: [0]
+  # Sm
+  MEI_INTR_IMPL: true
+  MSI_INTR_IMPL: true
+  MTI_INTR_IMPL: true
+  WFI_FINITE: true
+  MXLEN: 64
+  PRECISE_SYNCHRONOUS_EXCEPTIONS: true
+  TRAP_ON_ECALL_FROM_M: true
+  TRAP_ON_EBREAK: true
+  MARCHID_IMPLEMENTED: false        # mvendorid / marchid / mimpid / mhartid / mconfigptr 都读 0
+  MIMPID_IMPLEMENTED: false
+  VENDOR_ID_BANK: 0
+  VENDOR_ID_OFFSET: 0
+  MISALIGNED_LDST: false            # 未对齐访存报异常 (由 OpenSBI 模拟)，与 Spike 默认一致
+  MISALIGNED_LDST_EXCEPTION_PRIORITY: high   # LSU L0：先判未对齐，再判缺页 / 访问错误
+  TRAP_ON_ILLEGAL_WLRL: false
+  TRAP_ON_UNIMPLEMENTED_INSTRUCTION: true
+  TRAP_ON_RESERVED_INSTRUCTION: true
+  TRAP_ON_UNIMPLEMENTED_CSR: true
+  REPORT_VA_IN_MTVAL_ON_BREAKPOINT: true
+  REPORT_VA_IN_MTVAL_ON_LOAD_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_STORE_AMO_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_MISALIGNED: true
+  REPORT_VA_IN_MTVAL_ON_LOAD_ACCESS_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_STORE_AMO_ACCESS_FAULT: true
+  REPORT_VA_IN_MTVAL_ON_INSTRUCTION_ACCESS_FAULT: true
+  REPORT_ENCODING_IN_MTVAL_ON_ILLEGAL_INSTRUCTION: true
+  MTVAL_WIDTH: 64
+  CONFIG_PTR_ADDRESS: 0
+  PMA_GRANULARITY: 12
+  PHYS_ADDR_WIDTH: 40               # o6_pkg::PA_W
+  M_MODE_ENDIANNESS: little
+  MISA_CSR_IMPLEMENTED: true
+  MTVEC_ACCESS: rw
+  MTVEC_MODES: [0, 1]               # 写入时清 bit1
+  MTVEC_BASE_ALIGNMENT_DIRECT: 4
+  MTVEC_BASE_ALIGNMENT_VECTORED: 4
+  MTVEC_ILLEGAL_WRITE_BEHAVIOR: retain
+  NUM_PMP_ENTRIES: 16              # 规范只允许 0 / 16 / 64：16 项、8 项可用 (pmpaddr8..15 / pmpcfg2 只读 0)
+  PMP_GRANULARITY: 6                # G = 4：64 字节 (o6_pkg::PMP_G，#34)
+  NUM_USABLE_PMP_ENTRIES: 8
+  PMP_NA4_SUPPORTED: false          # G >= 1 时 NA4 不可选
+  PMP_NAPOT_SUPPORTED: true
+  PMP_TOR_SUPPORTED: true
+  # mhpmcounter3..6 计数，7..31 恒 0
+  HPM_COUNTER_EN: [false, false, false, true, true, true, true, false, false, false, false, false, false, false, false, false,
+                   false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+  HPM_COUNTER3_WIDTH: 64
+  HPM_COUNTER4_WIDTH: 64
+  HPM_COUNTER5_WIDTH: 64
+  HPM_COUNTER6_WIDTH: 64
+  HPM_EVENTS: [0]
+  MCOUNTINHIBIT_IMPLEMENTED: true
+  # mcountinhibit：CY / IR / HPM3..6 可写，TM 只读 0
+  COUNTINHIBIT_EN: [true, false, true, true, true, true, true, false, false, false, false, false, false, false, false, false,
+                    false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false]
+  MCOUNTENABLE_EN: [true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
+                    true, true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]
