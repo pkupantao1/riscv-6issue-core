@@ -33,40 +33,35 @@
     <text x="70" y="176">6</text><text x="70" y="120">8</text><text x="70" y="64">10</text>
   </g>
 
-  <!-- 柱 -->
-  <rect x="98"    y="203.7" width="50" height="136.3" rx="5" fill="url(#gb)"/>
-  <rect x="184.7" y="182.6" width="50" height="157.4" rx="5" fill="url(#gb)"/>
-  <rect x="271.3" y="167.7" width="50" height="172.3" rx="5" fill="url(#gb)"/>
-  <rect x="358"   y="149.0" width="50" height="191.0" rx="5" fill="url(#gb)"/>
-  <rect x="444.7" y="116.5" width="50" height="223.5" rx="5" fill="url(#gb)"/>
-  <rect x="531.3" y="91.0"  width="50" height="249.0" rx="5" fill="url(#gb)"/>
-  <rect x="618"   y="62.2"  width="50" height="277.8" rx="5" fill="url(#gp)"/>
-  <rect x="704.7" y="65.8"  width="50" height="274.2" rx="5" fill="url(#gb)"/>
-  <rect x="791.3" y="73.7"  width="50" height="266.3" rx="5" fill="url(#go)"/>
+  <!-- 柱：8 个版本，柱心 128.75 + 97.5 i，宽 54 -->
+  <rect x="101.75" y="182.6" width="54" height="157.4" rx="5" fill="url(#gb)"/>
+  <rect x="199.25" y="167.7" width="54" height="172.3" rx="5" fill="url(#gb)"/>
+  <rect x="296.75" y="149.0" width="54" height="191.0" rx="5" fill="url(#gb)"/>
+  <rect x="394.25" y="116.5" width="54" height="223.5" rx="5" fill="url(#gb)"/>
+  <rect x="491.75" y="91.0"  width="54" height="249.0" rx="5" fill="url(#gb)"/>
+  <rect x="589.25" y="62.2"  width="54" height="277.8" rx="5" fill="url(#gp)"/>
+  <rect x="686.75" y="65.8"  width="54" height="274.2" rx="5" fill="url(#gb)"/>
+  <rect x="784.25" y="73.7"  width="54" height="266.3" rx="5" fill="url(#go)"/>
 
   <!-- 数值 -->
-  <text class="v" x="123"   y="196">4.87</text>
-  <text class="v" x="209.7" y="175">5.62</text>
-  <text class="v" x="296.3" y="160">6.16</text>
-  <text class="v" x="383"   y="141">6.82</text>
-  <text class="v" x="469.7" y="109">7.98</text>
-  <text class="v" x="556.3" y="83">8.89</text>
-  <text class="v" x="643"   y="54" fill="#1D4ED8">9.92</text>
-  <text class="v" x="729.7" y="58">9.79</text>
-  <text class="v" x="816.3" y="66" fill="#C2410C">≈9.51</text>
+  <text class="v" x="128.75" y="175">5.62</text>
+  <text class="v" x="226.25" y="160">6.16</text>
+  <text class="v" x="323.75" y="141">6.82</text>
+  <text class="v" x="421.25" y="109">7.98</text>
+  <text class="v" x="518.75" y="83">8.89</text>
+  <text class="v" x="616.25" y="54" fill="#1D4ED8">9.92</text>
+  <text class="v" x="713.75" y="58">9.79</text>
+  <text class="v" x="811.25" y="66" fill="#C2410C">≈9.51</text>
 
   <!-- 横轴 -->
-  <g>
-    <text class="x" x="123"   y="362">t38</text><text class="xs" x="123"   y="380">初版</text>
-    <text class="x" x="209.7" y="362">t44</text><text class="xs" x="209.7" y="380">TAGE v2</text>
-    <text class="x" x="296.3" y="362">t49</text><text class="xs" x="296.3" y="380">ROB 192</text>
-    <text class="x" x="383"   y="362">s4</text><text class="xs" x="383"   y="380">12 端口</text><text class="xs" x="383" y="395">投机唤醒</text>
-    <text class="x" x="469.7" y="362">u3</text><text class="xs" x="469.7" y="380">B · IQ 扩容</text><text class="xs" x="469.7" y="395">SC · 6 ALU</text>
-    <text class="x" x="556.3" y="362">g4</text><text class="xs" x="556.3" y="380">move 消除</text><text class="xs" x="556.3" y="395">uPHT</text>
-    <text class="x" x="643"   y="362">h2</text><text class="xs" x="643"   y="380">load→load</text><text class="xs" x="643" y="395">快速路径</text>
-    <text class="x" x="729.7" y="362">u4</text><text class="xs" x="729.7" y="380">6 GHz</text><text class="xs" x="729.7" y="395">流水调整</text>
-    <text class="x" x="816.3" y="362">r11</text><text class="xs" x="816.3" y="380">RVA23 · H</text><text class="xs" x="816.3" y="395">Sv57 · 时序</text>
-  </g>
+  <text class="x" x="128.75" y="362">t44</text><text class="xs" x="128.75" y="380">TAGE v2</text>
+  <text class="x" x="226.25" y="362">t49</text><text class="xs" x="226.25" y="380">ROB 192</text>
+  <text class="x" x="323.75" y="362">s4</text><text class="xs" x="323.75" y="380">12 端口</text><text class="xs" x="323.75" y="395">投机唤醒</text>
+  <text class="x" x="421.25" y="362">u3</text><text class="xs" x="421.25" y="380">B · IQ 扩容</text><text class="xs" x="421.25" y="395">SC · 6 ALU</text>
+  <text class="x" x="518.75" y="362">g4</text><text class="xs" x="518.75" y="380">move 消除</text><text class="xs" x="518.75" y="395">uPHT</text>
+  <text class="x" x="616.25" y="362">h2</text><text class="xs" x="616.25" y="380">load→load</text><text class="xs" x="616.25" y="395">快速路径</text>
+  <text class="x" x="713.75" y="362">u4</text><text class="xs" x="713.75" y="380">6 GHz</text><text class="xs" x="713.75" y="395">流水调整</text>
+  <text class="x" x="811.25" y="362">r11</text><text class="xs" x="811.25" y="380">RVA23 · H</text><text class="xs" x="811.25" y="395">Sv57 · 时序</text>
 
   <!-- 图例 -->
   <rect x="600" y="410" width="12" height="12" rx="2" fill="#1D4ED8"/><text x="618" y="420" class="ax">最高（h2）</text>

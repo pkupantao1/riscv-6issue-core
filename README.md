@@ -1,6 +1,6 @@
-# riscv-6issue-core（OOO6）
+# riscv-6issue-core
 
-OOO6 是一个 **6 发射乱序 RV64 应用处理器核**，参照 **RVA23S64** 配置实现，另外支持 **Sv48 / Sv57** 和 **H 扩展**（两级地址翻译），带 **RVV 1.0 向量单元**（VLEN = 1024）。
+riscv-6issue-core 是一个 **6 发射乱序 RV64 应用处理器核**，参照 **RVA23S64** 配置实现，另外支持 **Sv48 / Sv57** 和 **H 扩展**（两级地址翻译），带 **RVV 1.0 向量单元**（VLEN = 1024）。
 
 - 所有功能都与 Spike 逐条提交对拍验证。
 - Linux 6.18 能在 Sv57 下启动到用户态。
@@ -45,11 +45,11 @@ OOO6 是一个 **6 发射乱序 RV64 应用处理器核**，参照 **RVA23S64** 
 
 ### 总体框图
 
-<p align="center"><img src="images/o6_uarch.svg" alt="OOO6 微架构框图" width="100%"></p>
+<p align="center"><img src="images/o6_uarch.svg" alt="riscv-6issue-core 微架构框图" width="100%"></p>
 
 ### SoC 顶层
 
-<p align="center"><img src="images/o6_soc.svg" alt="OOO6 SoC 顶层" width="100%"></p>
+<p align="center"><img src="images/o6_soc.svg" alt="riscv-6issue-core SoC 顶层" width="100%"></p>
 
 地址映射与 Spike / QEMU virt 一致，可以直接用 OpenSBI generic 平台加设备树。
 
@@ -128,7 +128,6 @@ CoreMark 在仿真里跑 10 次迭代（达不到官方要求的 10 秒），分
 
 | 版本 | 主要改动 | CoreMark/MHz |
 |---|---|---:|
-| t38 | 初版 | 4.867 |
 | t44 | TAGE v2 + 跨块训练修正 | 5.622 |
 | t49 | ROB 192、L1 32 KB | 6.155 |
 | s4 | 执行端口 8 → 12，load 投机唤醒 | 6.821 |
@@ -152,7 +151,7 @@ CoreMark（327 万条指令）：
 |---|---:|---:|---:|---:|
 | 改进前（cur） | 2.34 | 44.4 | 77.3 | 3.80 |
 | 香山参考（xs） | 1.17 | 15.8 | 32.2 | 5.00 |
-| OOO6 v2（入口起 32 B，每块 ≤ 2 分支） | **1.04** | **15.3** | **30.0** | 4.65 |
+| riscv-6issue-core v2（入口起 32 B，每块 ≤ 2 分支） | **1.04** | **15.3** | **30.0** | 4.65 |
 
 Linux 负载（OpenSBI + Linux 启动 + BusyBox，17.5 亿条指令）：
 
@@ -160,7 +159,7 @@ Linux 负载（OpenSBI + Linux 启动 + BusyBox，17.5 亿条指令）：
 |---|---:|---:|---:|---:|
 | 改进前 | 1.43 | 162.5 | 182.6 | 2.61 |
 | 香山参考 | 1.24 | 42 | 60 | 4.34 |
-| **OOO6 v2 全部改进** | **1.06** | 47 | 61 | **4.52** |
+| **riscv-6issue-core v2 全部改进** | **1.06** | 47 | 61 | **4.52** |
 
 在这些负载上，v2 的误预测比香山参考少约 15%，前端吞吐高约 4%，分支损失周期基本持平。
 
