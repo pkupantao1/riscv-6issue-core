@@ -1,0 +1,240 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 1012" width="1280" height="1012" font-family="'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Source Han Sans SC',sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#DC2626"/>
+    </marker>
+    <filter id="sh" x="-3%" y="-6%" width="106%" height="116%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.10"/>
+    </filter>
+    <linearGradient id="gRob" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3B82F6"/><stop offset="1" stop-color="#1E40AF"/>
+    </linearGradient>
+    <style>
+      .t  { font-size: 13px; fill: #334155; }
+      .tb { font-size: 14px; font-weight: 700; fill: #1E3A5F; }
+      .h  { font-size: 15px; font-weight: 700; }
+      .s  { font-size: 12px; fill: #475569; }
+      .c  { text-anchor: middle; }
+      .ln { stroke: #475569; stroke-width: 1.6; fill: none; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1280" height="1012" fill="#FFFFFF"/>
+
+  <!-- 标题 -->
+  <text x="40" y="44" font-size="24" font-weight="800" fill="#1E3A5F">OOO6 微架构</text>
+  <text x="200" y="44" font-size="14" fill="#64748B">6 发射乱序 RV64 · RVA23S64 + Sv48 / Sv57 + H · RVV 1.0（VLEN 1024）</text>
+
+  <!-- ============ 前端 ============ -->
+  <rect x="40" y="62" width="1200" height="164" rx="14" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="58" y="88" class="h" fill="#1D4ED8">前端（与后端解耦）</text>
+
+  <g>
+    <rect x="58" y="102" width="180" height="108" rx="10" fill="#FFFFFF" stroke="#93C5FD"/>
+    <text x="148" y="126" class="tb c">F0 · 下一 PC</text>
+    <text x="148" y="150" class="t c">uBTB 全相联</text>
+    <text x="148" y="170" class="t c">uPHT 带历史方向</text>
+    <text x="148" y="190" class="t c">重定向拍直接取指</text>
+
+    <rect x="269" y="102" width="290" height="108" rx="10" fill="#FFFFFF" stroke="#93C5FD"/>
+    <text x="414" y="126" class="tb c">F1 · 取指</text>
+    <text x="414" y="150" class="t c">I$ 64 KB · 16 路 · 取指块 32 B</text>
+    <text x="414" y="170" class="t c">ITLB · BTB</text>
+    <text x="414" y="190" class="t c">TAGE-SC-L（8 张带标签表）· ITTAGE</text>
+
+    <rect x="590" y="102" width="270" height="108" rx="10" fill="#FFFFFF" stroke="#93C5FD"/>
+    <text x="725" y="126" class="tb c">F2 / F3 · 预译码</text>
+    <text x="725" y="150" class="t c">找分支 · RVC 展开</text>
+    <text x="725" y="170" class="t c">最终预测覆盖重定向</text>
+    <text x="725" y="190" class="t c">链式 RAS</text>
+
+    <rect x="891" y="102" width="150" height="108" rx="10" fill="#DBEAFE" stroke="#60A5FA"/>
+    <text x="966" y="126" class="tb c">FTQ</text>
+    <text x="966" y="150" class="t c">64 项</text>
+    <text x="966" y="170" class="t c">折叠历史快照</text>
+    <text x="966" y="190" class="t c">提交后训练</text>
+
+    <rect x="1072" y="102" width="150" height="108" rx="10" fill="#DBEAFE" stroke="#60A5FA"/>
+    <text x="1147" y="126" class="tb c">取指缓冲</text>
+    <text x="1147" y="150" class="t c">32 项</text>
+    <text x="1147" y="170" class="t c">每拍送出 6 条</text>
+
+    <path class="ln" d="M238 156 H267" marker-end="url(#ar)"/>
+    <path class="ln" d="M559 156 H588" marker-end="url(#ar)"/>
+    <path class="ln" d="M860 156 H889" marker-end="url(#ar)"/>
+    <path class="ln" d="M1041 156 H1070" marker-end="url(#ar)"/>
+  </g>
+
+  <!-- 取指缓冲 → 译码 -->
+  <path class="ln" d="M1147 210 V244 H158 V296" marker-end="url(#ar)"/>
+
+  <!-- ============ 译码 / 重命名 / 分派 ============ -->
+  <rect x="40" y="262" width="860" height="118" rx="14" fill="#F5F3FF" stroke="#8B5CF6" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="58" y="287" class="h" fill="#6D28D9">译码 · 重命名 · 分派（每拍 6 条）</text>
+
+  <rect x="58" y="298" width="200" height="68" rx="10" fill="#FFFFFF" stroke="#C4B5FD"/>
+  <text x="158" y="324" class="tb c">译码 × 6</text>
+  <text x="158" y="346" class="t c">RVA23 全部指令</text>
+
+  <rect x="290" y="298" width="320" height="68" rx="10" fill="#FFFFFF" stroke="#C4B5FD"/>
+  <text x="450" y="320" class="tb c">重命名</text>
+  <text x="450" y="340" class="t c">RAT · Free list · move 消除</text>
+  <text x="450" y="358" class="t c">分支快照 × 48</text>
+
+  <rect x="642" y="298" width="240" height="68" rx="10" fill="#EDE9FE" stroke="#A78BFA"/>
+  <text x="762" y="324" class="tb c">分派</text>
+  <text x="762" y="346" class="t c">分配 ROB · LQ · SQ</text>
+
+  <path class="ln" d="M258 332 H288" marker-end="url(#ar)"/>
+  <path class="ln" d="M610 332 H640" marker-end="url(#ar)"/>
+  <path class="ln" d="M882 332 H928" marker-end="url(#ar)"/>
+
+  <!-- ============ ROB ============ -->
+  <rect x="930" y="262" width="310" height="118" rx="14" fill="url(#gRob)" filter="url(#sh)"/>
+  <text x="1085" y="298" class="c" font-size="20" font-weight="800" fill="#FFFFFF">ROB</text>
+  <text x="1085" y="324" class="c" font-size="13" fill="#E2E8F0">258 项（43 行 × 6）</text>
+  <text x="1085" y="344" class="c" font-size="13" fill="#E2E8F0">每拍按序提交 6 条</text>
+  <text x="1085" y="364" class="c" font-size="13" fill="#E2E8F0">异常 / 中断在 ROB 头处理</text>
+
+  <!-- 分派 → 各簇 -->
+  <path class="ln" d="M762 366 V400"/>
+  <path class="ln" d="M258 400 H1147"/>
+  <path class="ln" d="M258 400 V452" marker-end="url(#ar)"/>
+  <path class="ln" d="M656 400 V452" marker-end="url(#ar)"/>
+  <path class="ln" d="M954 400 V452" marker-end="url(#ar)"/>
+  <path class="ln" d="M1147 400 V452" marker-end="url(#ar)"/>
+  <circle cx="762" cy="400" r="3.5" fill="#475569"/>
+
+  <!-- 完成 → ROB -->
+  <path d="M1210 452 V382" stroke="#64748B" stroke-width="1.6" stroke-dasharray="5 4" fill="none" marker-end="url(#ar)"/>
+  <text x="1216" y="432" class="s">完成</text>
+
+  <!-- ============ 发射与执行 ============ -->
+  <rect x="40" y="416" width="1200" height="280" rx="14" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.5"/>
+  <text x="58" y="441" class="h" fill="#334155">发射与执行 · 15 个端口（发射时动态选端口）</text>
+
+  <!-- 整数簇 -->
+  <rect x="58" y="454" width="400" height="226" rx="12" fill="#E0F2FE" stroke="#0284C7" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="74" y="476" class="h" fill="#0369A1">整数簇</text>
+  <g font-size="13" font-weight="700" fill="#075985" text-anchor="middle">
+    <rect x="74" y="486" width="112" height="34" rx="8" fill="#BAE6FD" stroke="#0284C7"/><text x="130" y="508">IQ_A · 48</text>
+    <rect x="198" y="486" width="112" height="34" rx="8" fill="#BAE6FD" stroke="#0284C7"/><text x="254" y="508">IQ_B · 48</text>
+    <rect x="322" y="486" width="112" height="34" rx="8" fill="#BAE6FD" stroke="#0284C7"/><text x="378" y="508">IQ_C · 48</text>
+  </g>
+  <g font-size="12.5" fill="#334E68" text-anchor="middle">
+    <rect x="74" y="534" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="162" y="559"><tspan font-weight="700">P0</tspan>  ALU · BRU</text>
+    <rect x="258" y="534" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="346" y="559"><tspan font-weight="700">P1</tspan>  ALU · BRU</text>
+    <rect x="74" y="580" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="162" y="605"><tspan font-weight="700">P2</tspan>  ALU · BRU · MUL</text>
+    <rect x="258" y="580" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="346" y="605"><tspan font-weight="700">P3</tspan>  ALU · MUL · DIV · CSR</text>
+    <rect x="74" y="626" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="162" y="651"><tspan font-weight="700">P4</tspan>  ALU</text>
+    <rect x="258" y="626" width="176" height="40" rx="8" fill="#FFFFFF" stroke="#7DD3FC"/><text x="346" y="651"><tspan font-weight="700">P5</tspan>  ALU</text>
+  </g>
+
+  <!-- 访存簇 -->
+  <rect x="476" y="454" width="360" height="226" rx="12" fill="#FFF7ED" stroke="#F97316" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="492" y="476" class="h" fill="#C2410C">访存簇</text>
+  <g font-size="12.5" font-weight="700" fill="#9A3412" text-anchor="middle">
+    <rect x="492" y="486" width="76" height="34" rx="8" fill="#FED7AA" stroke="#F97316"/><text x="530" y="508">IQ_M 32</text>
+    <rect x="576" y="486" width="76" height="34" rx="8" fill="#FED7AA" stroke="#F97316"/><text x="614" y="508">IQ_N 32</text>
+    <rect x="660" y="486" width="76" height="34" rx="8" fill="#FED7AA" stroke="#F97316"/><text x="698" y="508">IQ_S 32</text>
+    <rect x="744" y="486" width="76" height="34" rx="8" fill="#FED7AA" stroke="#F97316"/><text x="782" y="508">IQ_D 32</text>
+  </g>
+  <g font-size="12.5" fill="#334E68" text-anchor="middle">
+    <rect x="492" y="534" width="104" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="544" y="559"><tspan font-weight="700">Load 0</tspan></text>
+    <rect x="604" y="534" width="104" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="656" y="559"><tspan font-weight="700">Load 1</tspan></text>
+    <rect x="716" y="534" width="104" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="768" y="559"><tspan font-weight="700">Load 2</tspan></text>
+    <rect x="492" y="580" width="160" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="572" y="605"><tspan font-weight="700">STA 0</tspan>  地址 / AMO</text>
+    <rect x="660" y="580" width="160" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="740" y="605"><tspan font-weight="700">STA 1</tspan>  地址</text>
+    <rect x="492" y="626" width="160" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="572" y="651"><tspan font-weight="700">STD 0</tspan>  整数数据</text>
+    <rect x="660" y="626" width="160" height="40" rx="8" fill="#FFFFFF" stroke="#FDBA74"/><text x="740" y="651"><tspan font-weight="700">STD 1</tspan>  整数数据</text>
+  </g>
+
+  <!-- 浮点簇 -->
+  <rect x="854" y="454" width="200" height="226" rx="12" fill="#FFF1F2" stroke="#F43F5E" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="870" y="476" class="h" fill="#BE123C">浮点簇</text>
+  <rect x="870" y="486" width="168" height="34" rx="8" fill="#FECDD3" stroke="#F43F5E"/>
+  <text x="954" y="508" class="c" font-size="13" font-weight="700" fill="#9F1239">IQ_F · 32</text>
+  <rect x="870" y="534" width="168" height="62" rx="8" fill="#FFFFFF" stroke="#FDA4AF"/>
+  <text x="954" y="558" class="tb c">FP0</text>
+  <text x="954" y="580" class="t c">FMA · FCMP · F2I</text>
+  <rect x="870" y="604" width="168" height="62" rx="8" fill="#FFFFFF" stroke="#FDA4AF"/>
+  <text x="954" y="628" class="tb c">FP1</text>
+  <text x="954" y="650" class="t c">FMA · FDIV / FSQRT</text>
+
+  <!-- 向量单元 -->
+  <rect x="1072" y="454" width="150" height="226" rx="12" fill="#FAE8FF" stroke="#C026D3" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="1088" y="476" class="h" fill="#A21CAF">向量单元</text>
+  <text x="1147" y="512" class="c" font-size="16" font-weight="800" fill="#86198F">RVV 1.0</text>
+  <text x="1147" y="538" class="t c">VLEN 1024</text>
+  <text x="1147" y="560" class="t c">按序执行</text>
+  <text x="1147" y="582" class="t c">与标量核解耦</text>
+  <text x="1147" y="604" class="t c">整行访存口</text>
+  <text x="1147" y="626" class="t c">Zvbb · Zvfhmin</text>
+  <text x="1147" y="648" class="t c">FP8 · 点积</text>
+
+  <!-- 分支误预测重定向 -->
+  <path d="M58 600 H24 V156 H56" stroke="#DC2626" stroke-width="1.6" stroke-dasharray="6 4" fill="none" marker-end="url(#arr)"/>
+  <text x="16" y="470" font-size="12" fill="#DC2626" transform="rotate(-90 16 470)" text-anchor="middle">分支误预测重定向</text>
+
+  <!-- ============ 物理寄存器堆 ============ -->
+  <rect x="58" y="716" width="400" height="44" rx="10" fill="#E0F2FE" stroke="#0284C7"/>
+  <text x="258" y="743" class="c" font-size="13.5" font-weight="700" fill="#075985">整数物理寄存器堆 · 256 × 64 位</text>
+  <rect x="854" y="716" width="200" height="44" rx="10" fill="#FFE4E6" stroke="#F43F5E"/>
+  <text x="954" y="743" class="c" font-size="13.5" font-weight="700" fill="#9F1239">浮点 PRF · 192 × 64</text>
+  <path class="ln" d="M258 682 V714" marker-start="url(#ar)" marker-end="url(#ar)"/>
+  <path class="ln" d="M954 682 V714" marker-start="url(#ar)" marker-end="url(#ar)"/>
+
+  <!-- ============ 存储层次 ============ -->
+  <rect x="40" y="790" width="1200" height="190" rx="14" fill="#F1F5F9" stroke="#94A3B8" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="58" y="815" class="h" fill="#334155">存储层次</text>
+
+  <rect x="258" y="830" width="200" height="132" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+  <text x="358" y="856" class="tb c">DTLB · PTW</text>
+  <text x="358" y="880" class="t c">Sv39 / Sv48 / Sv57</text>
+  <text x="358" y="900" class="t c">G-stage 两级翻译</text>
+  <text x="358" y="920" class="t c">PMP · Svpbmt · Svnapot</text>
+  <text x="358" y="940" class="t c">指针掩码</text>
+
+  <rect x="476" y="830" width="200" height="132" rx="10" fill="#FFEDD5" stroke="#F97316"/>
+  <text x="576" y="856" class="tb c">LSU</text>
+  <text x="576" y="880" class="t c">LQ 128 · SQ 64</text>
+  <text x="576" y="900" class="t c">store → load 转发</text>
+  <text x="576" y="920" class="t c">违例检测 · 依赖预测</text>
+  <text x="576" y="940" class="t c">load 投机唤醒</text>
+
+  <rect x="692" y="830" width="200" height="132" rx="10" fill="#FEF3C7" stroke="#F59E0B"/>
+  <text x="792" y="856" class="tb c">L1 D$</text>
+  <text x="792" y="880" class="t c">64 KB · 16 路 · VIPT</text>
+  <text x="792" y="900" class="t c">15 个 MSHR</text>
+  <text x="792" y="920" class="t c">步长预取</text>
+  <text x="792" y="940" class="t c">写回 · 写分配</text>
+
+  <rect x="908" y="830" width="180" height="132" rx="10" fill="#E0E7FF" stroke="#6366F1"/>
+  <text x="998" y="856" class="tb c">L2</text>
+  <text x="998" y="880" class="t c">1 MB · 8 路</text>
+  <text x="998" y="900" class="t c">非阻塞 · 8 MSHR</text>
+  <text x="998" y="920" class="t c">I$ / D$ 两个请求口</text>
+
+  <rect x="1104" y="830" width="118" height="132" rx="10" fill="#E5E7EB" stroke="#9CA3AF"/>
+  <text x="1163" y="856" class="tb c">AXI4</text>
+  <text x="1163" y="880" class="t c">128 位</text>
+  <text x="1163" y="900" class="t c">主存</text>
+  <text x="1163" y="920" class="t c">0x8000_0000</text>
+
+  <path class="ln" d="M476 896 H460" marker-end="url(#ar)"/>
+  <path class="ln" d="M676 896 H690" marker-end="url(#ar)"/>
+  <path class="ln" d="M892 896 H906" marker-end="url(#ar)"/>
+  <path class="ln" d="M1088 896 H1102" marker-end="url(#ar)"/>
+
+  <!-- 访存簇 → LSU；向量 → D$；I$ 缺失 → L2（画在底板之上） -->
+  <path class="ln" d="M656 680 V828" marker-end="url(#ar)"/>
+  <path class="ln" d="M1147 680 V770 H792 V828" marker-end="url(#ar)"/>
+  <text x="1155" y="764" class="s">向量访存</text>
+  <path class="ln" d="M998 778 V828" marker-end="url(#ar)"/>
+  <text x="1006" y="806" class="s">I$ 缺失</text>
+
+  <text x="40" y="1000" class="s">数字为 rtl/pkg/o6_pkg.sv 中的默认参数。外设（CLINT · PLIC · UART · BootROM · 调试模块）经 MMIO 通道连接，图中未画出。</text>
+</svg>

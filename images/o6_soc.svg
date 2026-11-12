@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1240 560" width="1240" height="560" font-family="'Segoe UI','PingFang SC','Microsoft YaHei','Noto Sans CJK SC','Source Han Sans SC',sans-serif">
+  <defs>
+    <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
+    </marker>
+    <filter id="sh" x="-4%" y="-8%" width="108%" height="120%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1E3A8A" flood-opacity="0.12"/>
+    </filter>
+    <style>
+      .tb { font-size: 14px; font-weight: 700; fill: #1E3A5F; }
+      .t  { font-size: 12.5px; fill: #3E5068; }
+      .s  { font-size: 12px; fill: #64748B; }
+      .c  { text-anchor: middle; }
+      .ln { stroke: #475569; stroke-width: 1.6; fill: none; }
+    </style>
+  </defs>
+  <rect width="1240" height="560" fill="#FFFFFF"/>
+  <text x="40" y="40" font-size="22" font-weight="800" fill="#1E3A5F">OOO6 SoC 顶层</text>
+  <text x="210" y="40" font-size="13.5" fill="#64748B">地址映射与 Spike / QEMU virt 一致，可直接用 OpenSBI generic 平台</text>
+
+  <!-- 调试链 -->
+  <g filter="url(#sh)">
+    <rect x="60" y="78" width="200" height="44" rx="10" fill="#F5F3FF" stroke="#8B5CF6" stroke-width="1.5"/>
+    <rect x="60" y="146" width="200" height="44" rx="10" fill="#F5F3FF" stroke="#8B5CF6" stroke-width="1.5"/>
+    <rect x="60" y="214" width="200" height="44" rx="10" fill="#EDE9FE" stroke="#8B5CF6" stroke-width="1.5"/>
+  </g>
+  <text x="160" y="105" class="tb c">JTAG</text>
+  <text x="160" y="173" class="tb c">DTM</text>
+  <text x="160" y="241" class="tb c">调试模块 DM</text>
+  <text x="272" y="105" class="s">外部调试器</text>
+  <text x="272" y="173" class="s">Debug 0.13.2</text>
+  <path class="ln" d="M160 122 V144" marker-end="url(#ar)"/>
+  <path class="ln" d="M160 190 V212" marker-end="url(#ar)"/>
+  <path class="ln" d="M260 236 H358" marker-end="url(#ar)"/>
+  <text x="270" y="228" class="s">停核 / progbuf</text>
+
+  <!-- 核 -->
+  <rect x="360" y="64" width="640" height="200" rx="16" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.8" filter="url(#sh)"/>
+  <text x="380" y="92" font-size="16" font-weight="800" fill="#1D4ED8">o6_core</text>
+  <g font-size="13" fill="#1E3A5F" text-anchor="middle">
+    <rect x="380" y="106" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="450" y="131">前端 · 分支预测</text>
+    <rect x="532" y="106" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="602" y="131">重命名 · ROB</text>
+    <rect x="684" y="106" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="754" y="131">整数执行 × 6</text>
+    <rect x="836" y="106" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="906" y="131">FPU（cvfpu）</text>
+    <rect x="380" y="156" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="450" y="181">LSU</text>
+    <rect x="532" y="156" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="602" y="181">MMU · PMP</text>
+    <rect x="684" y="156" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="754" y="181">向量单元 RVV</text>
+    <rect x="836" y="156" width="140" height="40" rx="8" fill="#FFFFFF" stroke="#93C5FD"/><text x="906" y="181">CSR · 特权 · H</text>
+    <rect x="380" y="206" width="292" height="40" rx="8" fill="#DBEAFE" stroke="#60A5FA"/><text x="526" y="231" font-weight="700">L1 I$ · 64 KB · 16 路</text>
+    <rect x="684" y="206" width="292" height="40" rx="8" fill="#DBEAFE" stroke="#60A5FA"/><text x="830" y="231" font-weight="700">L1 D$ · 64 KB · 16 路</text>
+  </g>
+
+  <!-- 缓存通路 -->
+  <path class="ln" d="M500 264 V318" marker-end="url(#ar)"/>
+  <text x="508" y="296" class="s">L1 缺失 / 写回</text>
+  <rect x="400" y="320" width="200" height="70" rx="12" fill="#E0E7FF" stroke="#6366F1" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="500" y="348" class="tb c">L2 · 1 MB · 8 路</text>
+  <text x="500" y="370" class="t c">非阻塞 · 8 MSHR</text>
+  <path class="ln" d="M500 390 V448" marker-end="url(#ar)"/>
+  <text x="508" y="424" class="s">AXI4 · 128 位</text>
+  <rect x="400" y="450" width="200" height="70" rx="12" fill="#F1F5F9" stroke="#94A3B8" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="500" y="478" class="tb c">主存</text>
+  <text x="500" y="500" class="t c">0x8000_0000 起</text>
+
+  <!-- MMIO 通路 -->
+  <path class="ln" d="M904 264 V318" marker-end="url(#ar)"/>
+  <text x="912" y="296" class="s">MMIO（AXI4 · 64 位）</text>
+  <rect x="800" y="320" width="208" height="70" rx="12" fill="#FFF7ED" stroke="#F97316" stroke-width="1.5" filter="url(#sh)"/>
+  <text x="904" y="348" class="tb c">外设互连</text>
+  <text x="904" y="370" class="t c">只在 ROB 头非投机访问</text>
+  <path class="ln" d="M904 390 V420"/>
+  <path class="ln" d="M691 420 H1129"/>
+  <path class="ln" d="M691 420 V448" marker-end="url(#ar)"/>
+  <path class="ln" d="M837 420 V448" marker-end="url(#ar)"/>
+  <path class="ln" d="M983 420 V448" marker-end="url(#ar)"/>
+  <path class="ln" d="M1129 420 V448" marker-end="url(#ar)"/>
+  <g filter="url(#sh)">
+    <rect x="626" y="450" width="130" height="70" rx="12" fill="#FEF3C7" stroke="#F59E0B" stroke-width="1.5"/>
+    <rect x="772" y="450" width="130" height="70" rx="12" fill="#FFE4E6" stroke="#F43F5E" stroke-width="1.5"/>
+    <rect x="918" y="450" width="130" height="70" rx="12" fill="#E0F2FE" stroke="#0284C7" stroke-width="1.5"/>
+    <rect x="1064" y="450" width="130" height="70" rx="12" fill="#FAE8FF" stroke="#C026D3" stroke-width="1.5"/>
+  </g>
+  <text x="691" y="478" class="tb c">CLINT</text><text x="691" y="500" class="t c">0x0200_0000</text>
+  <text x="837" y="478" class="tb c">PLIC</text><text x="837" y="500" class="t c">0x0C00_0000</text>
+  <text x="983" y="478" class="tb c">UART16550</text><text x="983" y="500" class="t c">0x1000_0000</text>
+  <text x="1129" y="478" class="tb c">BootROM</text><text x="1129" y="500" class="t c">0x0000_1000</text>
+
+  <!-- 中断 -->
+  <path d="M691 520 V532 H1222 V166 H1002" stroke="#F43F5E" stroke-width="1.5" stroke-dasharray="5 4" fill="none" marker-end="url(#ar)"/>
+  <path d="M837 520 V532" stroke="#F43F5E" stroke-width="1.5" stroke-dasharray="5 4" fill="none"/>
+  <text x="1212" y="300" font-size="12" fill="#E11D48" transform="rotate(-90 1212 300)" text-anchor="middle">定时 / 软件 / 外部中断</text>
+
+  <text x="40" y="548" class="s">FPGA 原型（VU7P）上主存换成 URAM 16 MB，另加 JTAG-AXI 桥用于装载镜像。</text>
+</svg>
