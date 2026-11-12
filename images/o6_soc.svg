@@ -15,8 +15,8 @@
     </style>
   </defs>
   <rect width="1240" height="560" fill="#FFFFFF"/>
-  <text x="40" y="40" font-size="22" font-weight="800" fill="#1E3A5F">riscv-6issue-core SoC 顶层</text>
-  <text x="355" y="40" font-size="13.5" fill="#64748B">地址映射与 Spike / QEMU virt 一致，可直接用 OpenSBI generic 平台</text>
+  <text x="40" y="40" font-size="22" font-weight="800" fill="#1E3A5F">RISC-V 6-Issue Core SoC 顶层</text>
+  <text x="372" y="40" font-size="13.5" fill="#64748B">地址映射与 Spike / QEMU virt 一致，可直接用 OpenSBI generic 平台</text>
 
   <!-- 调试链 -->
   <g filter="url(#sh)">
