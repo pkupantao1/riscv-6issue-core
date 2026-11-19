@@ -20,7 +20,7 @@ case $N in
             DWSV=/export/SoftWare/Synopsys/syn/O-2018.06-SP1/dw/sim_ver
             case "$VDEFS" in *O6_DW_SIM*) VDEFS="$VDEFS -y $DWSV +libext+.v +incdir+$DWSV" ;; esac ;;
   # 向量执行器 VL (V1，docs/11 §9h)：整数 (独立参考模型) / FP32 加乘 (shortreal) / FP64 乘加 (整数值，精确)
-  vex)      DUT="$(tr '\n' ' ' < $ROOT/rtl/fpu/cvfpu.f) rtl/vec/o6_vex.sv"; TOP=tb_vex; HIER="tb_vex.dut"
+  vex)      DUT="$(tr '\n' ' ' < $ROOT/rtl/fpu/cvfpu.f) rtl/vec/o6_vex.sv"; TOP=tb_vex; HIER="tb_vex.dut_lp tb_vex.dut_hp"
             VDEFS="$VDEFS +incdir+$SRC/third_party/cvfpu/src/common_cells/include" ;;
   # 乘法器：VDEFS="+define+O6_DW_SIM [+define+O6_MUL_SEGW=N]" 走 DW02_multp / DW02_tree 仿真模型
   mul)      DUT="rtl/exu/o6_mul.sv"; TOP=tb_mul; HIER="tb_mul.dut"

@@ -31,18 +31,47 @@ module tb_vex;
   logic [TW-1:0]       out_tag;
   logic [4:0]          out_ff;
 
-  o6_vex #(.TW(TW)) dut (
+  // V7：两种执行器各一个 —— 低精度 (整数 / FP16) 与 FP64 / FP32；本拍按种类只送其中一个 (hp_sel)，延迟相同，输出合并后按送入顺序核对
+  logic                hp_sel;
+  logic                v_lp, v_hp;
+  logic [VLEN-1:0]     d_lp, d_hp;
+  logic [TW-1:0]       t_lp, t_hp;
+  logic [4:0]          f_lp, f_hp;
+  o6_vex #(.TW(TW), .HP(1'b0)) dut_lp (
     .clk_i(clk), .rst_ni(rst_n),
-    .in_v_i(in_v), .in_raw_i(in_raw), .in_sew_i(in_sew), .in_nel_i(in_nel), .in_m_i(in_m),
+    .in_v_i(in_v && !hp_sel), .in_raw_i(in_raw), .in_sew_i(in_sew), .in_nel_i(in_nel), .in_m_i(in_m),
     .in_vs2_i(in_vs2), .in_vs1_i(in_vs1), .in_vd_i(in_vd), .in_xs_i(in_xs), .in_frm_i(in_frm), .in_tag_i(in_tag),
-    .out_v_o(out_v), .out_d_o(out_d), .out_tag_o(out_tag), .out_ff_o(out_ff)
+    .out_v_o(v_lp), .out_d_o(d_lp), .out_tag_o(t_lp), .out_ff_o(f_lp)
   );
+  o6_vex #(.TW(TW), .HP(1'b1)) dut_hp (
+    .clk_i(clk), .rst_ni(rst_n),
+    .in_v_i(in_v && hp_sel), .in_raw_i(in_raw), .in_sew_i(in_sew), .in_nel_i(in_nel), .in_m_i(in_m),
+    .in_vs2_i(in_vs2), .in_vs1_i(in_vs1), .in_vd_i(in_vd), .in_xs_i(in_xs), .in_frm_i(in_frm), .in_tag_i(in_tag),
+    .out_v_o(v_hp), .out_d_o(d_hp), .out_tag_o(t_hp), .out_ff_o(f_hp)
+  );
+  assign out_v   = v_lp || v_hp;
+  assign out_d   = v_hp ? d_hp : d_lp;
+  assign out_tag = v_hp ? t_hp : t_lp;
+  assign out_ff  = v_hp ? f_hp : f_lp;
+  always @(posedge clk) if (rst_n && v_lp && v_hp) begin $display("错误：两个单元同拍出结果"); end
+
+  // FP16 精确整数 (|n| < 2048) 的编码
+  function automatic logic [15:0] h_of(input int n);
+    int a, ex;
+    logic [15:0] r;
+    if (n == 0) return 16'h0000;
+    a = (n < 0) ? -n : n;
+    ex = 0;
+    while ((a >> ex) > 1) ex++;
+    r = {1'(n < 0), 5'(ex + 15), 10'((a << (10 - ex)) & 32'h3FF)};
+    return r;
+  endfunction
 
   // 期望结果队列 (按送入顺序)
   logic [VLEN-1:0] exp_q [$];
   logic [TW-1:0]   tag_q [$];
   int              t_in_q [$];
-  int              cyc = 0, n_ok = 0, n_err = 0, n_int = 0, n_f32 = 0, n_f64 = 0;
+  int              cyc = 0, n_ok = 0, n_err = 0, n_int = 0, n_f32 = 0, n_f64 = 0, n_f16 = 0;
   always @(posedge clk) cyc <= cyc + 1;
 
   // 编码：OP-V，funct6 / vm / vs2 / vs1(rs1) / funct3 / vd，opcode 1010111
@@ -85,7 +114,8 @@ module tb_vex;
     logic       vm;
     logic [4:0] rs1;
     logic [VLEN-1:0] e;
-    k = $urandom_range(0, 9);
+    k = $urandom_range(0, 11);
+    hp_sel = (k == 6 || k == 7 || k == 8 || k == 9);
     for (int j = 0; j < VLEN / 32; j++) begin
       in_vs2[32*j +: 32] = $urandom; in_vs1[32*j +: 32] = $urandom; in_vd[32*j +: 32] = $urandom;
     end
@@ -150,6 +180,21 @@ module tb_vex;
           e[32*el +: 32] = $shortrealtobits(sr);
         end
       n_f32++;
+    end else if (k >= 10) begin
+      // FP16 vfmacc.vv (低精度单元)：操作数取小整数，|a × b + c| < 2048 时 FP16 精确
+      int ia, ib, ic;
+      in_sew = 2'd1; ne = VLEN / 16;
+      in_raw = enc(6'b101100, vm, 3'b001, rs1);
+      in_nel = $urandom_range(0, 1) ? 8'(ne) : 8'($urandom_range(0, ne));
+      e = in_vd;
+      for (int el = 0; el < ne; el++) begin
+        ia = $urandom_range(0, 60) - 30; ib = $urandom_range(0, 60) - 30; ic = $urandom_range(0, 2000) - 1000;
+        in_vs2[16*el +: 16] = h_of(ia); in_vs1[16*el +: 16] = h_of(ib); in_vd[16*el +: 16] = h_of(ic);
+        if (ia * ib + ic > 2047 || ia * ib + ic < -2047) begin ic = 0; in_vd[16*el +: 16] = h_of(0); end
+        e[16*el +: 16] = in_vd[16*el +: 16];
+        if (el < int'(in_nel) && (vm || in_m[el])) e[16*el +: 16] = h_of(ia * ib + ic);
+      end
+      n_f16++;
     end else begin
       // FP64 vfmacc.vv：vd = vs1 × vs2 + vd，操作数取小整数 (精确)
       real ra, rb, rc;
@@ -205,8 +250,8 @@ module tb_vex;
     end
     @(negedge clk); in_v = 1'b0;
     repeat (40) @(posedge clk);
-    $display("拍数 %0d (整数 %0d、FP32 %0d、FP64 %0d)，正确 %0d，错误 %0d，延迟 %0d 拍，剩 %0d", NB, n_int, n_f32, n_f64,
-             n_ok, n_err, lat, exp_q.size());
+    $display("拍数 %0d (整数 %0d、FP16 %0d [低精度单元]、FP32 %0d、FP64 %0d [FP64/FP32 单元])，正确 %0d，错误 %0d，延迟 %0d 拍，剩 %0d",
+             NB, n_int, n_f16, n_f32, n_f64, n_ok, n_err, lat, exp_q.size());
     if (n_err == 0 && exp_q.size() == 0 && n_ok == NB) $display("=== UNIT PASS ===");
     else $display("=== UNIT FAIL ===");
     $finish;

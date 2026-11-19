@@ -3,6 +3,9 @@
     <marker id="ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#475569"/>
     </marker>
+    <marker id="art" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2563EB"/>
+    </marker>
     <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M0,0 L10,5 L0,10 z" fill="#DC2626"/>
     </marker>
@@ -27,7 +30,7 @@
 
   <!-- 标题 -->
   <text x="40" y="44" font-size="24" font-weight="800" fill="#1E3A5F">RISC-V 6-Issue Core 微架构</text>
-  <text x="372" y="44" font-size="14" fill="#64748B">6 发射乱序 RV64 · RVA23S64 + Sv48 / Sv57 + H · RVV 1.0（VLEN 1024，向量指令核内乱序，4 个向量执行器）</text>
+  <text x="372" y="44" font-size="14" fill="#64748B">6 发射乱序 RV64 · RVA23S64 + Sv48 / Sv57 + H · RVV 1.0（VLEN 1024，向量指令核内乱序，5 个向量执行器）</text>
 
   <!-- ============ 前端 ============ -->
   <rect x="40" y="62" width="1200" height="164" rx="14" fill="#EFF6FF" stroke="#3B82F6" stroke-width="1.5" filter="url(#sh)"/>
@@ -42,7 +45,7 @@
 
     <rect x="269" y="102" width="290" height="108" rx="10" fill="#FFFFFF" stroke="#93C5FD"/>
     <text x="414" y="126" class="tb c">F1 · 取指</text>
-    <text x="414" y="150" class="t c">I$ 64 KB · 16 路 · 取指块 32 B</text>
+    <text x="414" y="150" class="t c">读 L1 I$ · 每拍取指块 32 B</text>
     <text x="414" y="170" class="t c">ITLB · BTB</text>
     <text x="414" y="190" class="t c">TAGE-SC-L（8 张带标签表）· ITTAGE</text>
 
@@ -116,7 +119,7 @@
 
   <!-- ============ 发射与执行 ============ -->
   <rect x="40" y="416" width="1200" height="280" rx="14" fill="#F8FAFC" stroke="#CBD5E1" stroke-width="1.5"/>
-  <text x="58" y="441" class="h" fill="#334155">发射与执行 · 15 个标量端口（发射时动态选端口）+ 4 个向量执行器</text>
+  <text x="58" y="441" class="h" fill="#334155">发射与执行 · 15 个标量端口（发射时动态选端口）+ 5 个向量执行器</text>
 
   <!-- 整数簇 -->
   <rect x="58" y="454" width="400" height="226" rx="12" fill="#E0F2FE" stroke="#0284C7" stroke-width="1.5" filter="url(#sh)"/>
@@ -171,11 +174,12 @@
   <text x="1088" y="476" class="h" fill="#A21CAF">向量簇</text>
   <rect x="1088" y="486" width="118" height="34" rx="8" fill="#F5D0FE" stroke="#C026D3"/>
   <text x="1147" y="508" class="c" font-size="13" font-weight="700" fill="#86198F">VIQ · 64</text>
-  <g font-size="12.5" fill="#334E68" text-anchor="middle">
-    <rect x="1088" y="534" width="118" height="28" rx="8" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="553"><tspan font-weight="700">VX0</tspan>  运算 · 点积</text>
-    <rect x="1088" y="568" width="118" height="28" rx="8" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="587"><tspan font-weight="700">VX1</tspan>  运算 · 点积</text>
-    <rect x="1088" y="602" width="118" height="28" rx="8" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="621"><tspan font-weight="700">VX2</tspan>  运算 · 点积</text>
-    <rect x="1088" y="636" width="118" height="28" rx="8" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="655"><tspan font-weight="700">VX3</tspan>  运算 · 点积</text>
+  <g font-size="12" fill="#334E68" text-anchor="middle">
+    <rect x="1088" y="528" width="118" height="24" rx="7" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="545"><tspan font-weight="700">VX0</tspan>  低精度</text>
+    <rect x="1088" y="556" width="118" height="24" rx="7" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="573"><tspan font-weight="700">VX1</tspan>  低精度</text>
+    <rect x="1088" y="584" width="118" height="24" rx="7" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="601"><tspan font-weight="700">VX2</tspan>  低精度</text>
+    <rect x="1088" y="612" width="118" height="24" rx="7" fill="#FFFFFF" stroke="#E879F9"/><text x="1147" y="629"><tspan font-weight="700">VX3</tspan>  低精度</text>
+    <rect x="1088" y="640" width="118" height="28" rx="7" fill="#F5D0FE" stroke="#C026D3"/><text x="1147" y="659"><tspan font-weight="700">VX4</tspan>  FP64 / FP32</text>
   </g>
 
   <!-- 分支误预测重定向 -->
@@ -197,34 +201,41 @@
   <rect x="40" y="790" width="1200" height="190" rx="14" fill="#F1F5F9" stroke="#94A3B8" stroke-width="1.5" filter="url(#sh)"/>
   <text x="58" y="815" class="h" fill="#334155">存储层次</text>
 
-  <rect x="258" y="830" width="200" height="132" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
+  <rect x="58" y="830" width="182" height="122" rx="10" fill="#DBEAFE" stroke="#60A5FA"/>
+  <text x="149" y="856" class="tb c">L1 I$</text>
+  <text x="149" y="880" class="t c">64 KB · 16 路 · VIPT</text>
+  <text x="149" y="900" class="t c">64 B 行 · 每拍读 32 B</text>
+  <text x="149" y="920" class="t c">16 路并读 · 伪 LRU</text>
+  <text x="149" y="940" class="t c">阻塞式缺失 · fence.i</text>
+
+  <rect x="258" y="830" width="200" height="122" rx="10" fill="#FFFFFF" stroke="#CBD5E1"/>
   <text x="358" y="856" class="tb c">DTLB · PTW</text>
   <text x="358" y="880" class="t c">Sv39 / Sv48 / Sv57</text>
   <text x="358" y="900" class="t c">G-stage 两级翻译</text>
   <text x="358" y="920" class="t c">PMP · Svpbmt · Svnapot</text>
   <text x="358" y="940" class="t c">指针掩码</text>
 
-  <rect x="476" y="830" width="200" height="132" rx="10" fill="#FFEDD5" stroke="#F97316"/>
+  <rect x="476" y="830" width="200" height="122" rx="10" fill="#FFEDD5" stroke="#F97316"/>
   <text x="576" y="856" class="tb c">LSU</text>
   <text x="576" y="880" class="t c">LQ 128 · SQ 64</text>
   <text x="576" y="900" class="t c">store → load 按字节转发</text>
   <text x="576" y="920" class="t c">违例检测 · 依赖预测</text>
   <text x="576" y="940" class="t c">向量按 128 B 行访存</text>
 
-  <rect x="692" y="830" width="200" height="132" rx="10" fill="#FEF3C7" stroke="#F59E0B"/>
+  <rect x="692" y="830" width="200" height="122" rx="10" fill="#FEF3C7" stroke="#F59E0B"/>
   <text x="792" y="856" class="tb c">L1 D$</text>
   <text x="792" y="880" class="t c">128 KB · 32 路 · VIPT</text>
   <text x="792" y="900" class="t c">128 B 行 · 15 个 MSHR</text>
   <text x="792" y="920" class="t c">步长预取</text>
   <text x="792" y="940" class="t c">写回 · 写分配</text>
 
-  <rect x="908" y="830" width="180" height="132" rx="10" fill="#E0E7FF" stroke="#6366F1"/>
+  <rect x="908" y="830" width="180" height="122" rx="10" fill="#E0E7FF" stroke="#6366F1"/>
   <text x="998" y="856" class="tb c">L2</text>
   <text x="998" y="880" class="t c">1 MB · 8 路</text>
   <text x="998" y="900" class="t c">非阻塞 · 8 MSHR</text>
   <text x="998" y="920" class="t c">I$ / D$ 两个请求口</text>
 
-  <rect x="1104" y="830" width="118" height="132" rx="10" fill="#E5E7EB" stroke="#9CA3AF"/>
+  <rect x="1104" y="830" width="118" height="122" rx="10" fill="#E5E7EB" stroke="#9CA3AF"/>
   <text x="1163" y="856" class="tb c">AXI4</text>
   <text x="1163" y="880" class="t c">128 位</text>
   <text x="1163" y="900" class="t c">主存</text>
@@ -239,8 +250,13 @@
   <path class="ln" d="M560 680 V828" marker-end="url(#ar)"/>
   <path class="ln" d="M1110 760 V772 H640 V828" marker-end="url(#ar)"/>
   <text x="652" y="767" class="s">向量 load / store：经共用 LSU 的 load 流水与 SQ</text>
-  <path class="ln" d="M998 778 V828" marker-end="url(#ar)"/>
-  <text x="1006" y="806" class="s">I$ 缺失</text>
+  <!-- F1 ↔ L1 I$：沿左边距下来 -->
+  <path d="M300 210 V234 H48 V891 H56" stroke="#2563EB" stroke-width="1.6" fill="none" marker-start="url(#art)" marker-end="url(#art)"/>
+  <text x="44" y="752" font-size="12" fill="#2563EB" transform="rotate(-90 44 752)" text-anchor="middle">取指 32 B</text>
+  <!-- L1 I$ 缺失 → L2：沿存储层次底部 -->
+  <path d="M149 952 V968 H998 V954" stroke="#2563EB" stroke-width="1.6" fill="none" marker-end="url(#art)"/>
+  <rect x="496" y="961" width="128" height="14" fill="#F1F5F9"/>
+  <text x="560" y="972" class="s c" fill="#2563EB">I$ 缺失：取 64 B 行</text>
 
   <!-- ============ VECU 详细 ============ -->
   <rect x="40" y="1000" width="1200" height="484" rx="14" fill="#FDF4FF" stroke="#C026D3" stroke-width="1.5" filter="url(#sh)"/>
@@ -249,13 +265,13 @@
   <!-- 第 1 层：VIQ → 执行器 × 4 → VPRF -->
   <rect x="58" y="1072" width="170" height="134" rx="10" fill="#F5D0FE" stroke="#C026D3"/>
   <text x="143" y="1096" class="tv c">VIQ · 64 项</text>
-  <text x="143" y="1120" class="t c">每拍发 ≤ 4 条运算</text>
+  <text x="143" y="1120" class="t c">每拍发 ≤ 5 条运算</text>
   <text x="143" y="1140" class="t c">+ 1 个 store 数据</text>
-  <text x="143" y="1160" class="t c">第 0 个源写好即发</text>
-  <text x="143" y="1180" class="t c">其余可链式等写回</text>
+  <text x="143" y="1160" class="t c">FP32 / FP64 只发 VX4</text>
+  <text x="143" y="1180" class="t c">其余发 VX0–VX3</text>
 
   <rect x="252" y="1040" width="700" height="180" rx="12" fill="#FAE8FF" stroke="#E879F9" stroke-dasharray="6 4"/>
-  <text x="268" y="1062" class="tb" fill="#86198F">执行器 × 4（每个都有序列器、o6_vex、o6_vdot、写回口和完成口）</text>
+  <text x="268" y="1062" class="tb" fill="#86198F">执行器 × 5（均 1024 位）：VX0–VX3 FP8 / FP16 / BF16 / INT8 合成单元，VX4 FP64 / FP32 合成单元</text>
 
   <rect x="268" y="1072" width="170" height="134" rx="10" fill="#FFFFFF" stroke="#E879F9"/>
   <text x="353" y="1096" class="tv c">序列器</text>
@@ -266,10 +282,11 @@
 
   <rect x="462" y="1072" width="220" height="60" rx="10" fill="#FFFFFF" stroke="#E879F9"/>
   <text x="572" y="1094" class="tv c">o6_vex 运算 · 固定 7 拍</text>
-  <text x="572" y="1118" class="t c">整数 fx_calc + 16 条 fpnew</text>
+  <text x="572" y="1112" class="s c">VX0–3：整数 + FP16 / BF16 / FP8</text>
+  <text x="572" y="1127" class="s c">VX4：FP32 / FP64（16 条 fpnew）</text>
 
   <rect x="462" y="1140" width="220" height="66" rx="10" fill="#FFFFFF" stroke="#E879F9"/>
-  <text x="572" y="1160" class="tv c">o6_vdot 点积 FP8 / INT8</text>
+  <text x="572" y="1160" class="tv c">o6_vdot 点积（VX0–VX3）</text>
   <text x="572" y="1180" class="t c">A 段求最大指数 · B 段对齐求和</text>
   <text x="572" y="1198" class="t c">乒乓缓冲 · 累加器转发</text>
 
@@ -284,7 +301,7 @@
   <text x="1099" y="1096" class="tv c">VPRF · 192 项 × 1024 位</text>
   <text x="1099" y="1120" class="t c">核内池 144：核内乱序的目的</text>
   <text x="1099" y="1140" class="t c">VECU 池 48：原路径改名</text>
-  <text x="1099" y="1160" class="t c">写口：执行器 4 + load 3</text>
+  <text x="1099" y="1160" class="t c">写口：执行器 5 + load 3</text>
   <text x="1099" y="1180" class="t c">原路径按 crat 读写</text>
 
   <path class="ln" d="M228 1139 H266" marker-end="url(#ar)"/>

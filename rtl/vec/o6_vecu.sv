@@ -4136,7 +4136,7 @@ module o6_vecu
     logic [XTW-1:0]  o_tag;
     logic [VLEN-1:0] o_d;
     logic [4:0]      o_ff;
-    o6_vex #(.TW(XTW)) u_vex (
+    o6_vex #(.TW(XTW), .HP(x == VX_HP)) u_vex (
       .clk_i, .rst_ni,
       .in_v_i(xb_vx), .in_raw_i(xb_raw), .in_sew_i(xb_sew), .in_nel_i(xb_nel), .in_m_i(xb_m),
       .in_vs2_i(xb_d[0]), .in_vs1_i(xb_d[1]), .in_vd_i(xb_d[2]), .in_xs_i(xb_xs), .in_frm_i(frm_i),
@@ -4152,15 +4152,21 @@ module o6_vecu
     vsrc_t           drd;
     logic [VLEN-1:0] drd_d;
     assign drd_d = !drd.use_ ? '0 : drd.cr ? vprf[crat[drd.ar]] : vprf[drd.p];
-    o6_vdot #(.TW(DTW), .XL(XL)) u_vdot (
-      .clk_i, .rst_ni, .flush_i, .br_upd_i,
-      .in_v_i(xb_v && xb_dot), .in_first_i(xb_first), .in_last_i(xb_last), .in_k_i(xb_k),
-      .in_raw_i(xb_raw), .in_alt_i(xb_alt), .in_lm_i(xb_lm),
-      .in_vs2_i(xb_d[0]), .in_vs1_i(xb_d[1]), .in_vdo_i(xb_s[2]), .in_pd_i(xb_pd), .in_act_i(xb_act),
-      .in_bm_i(xb_bm), .in_tag_i({xb_pd, xb_rob, xb_raw}),
-      .a_rdy_o(d_rdy), .blk_o(d_blk), .rd_o(drd), .rd_d_i(drd_d),
-      .out_v_o(dv), .out_d_o(dd), .out_tag_o(dtag), .out_ff_o(dff)
-    );
+    // V7：点积单元只在低精度执行器 (0..NVX_LP-1) 里；FP64 / FP32 执行器没有 (VIQ 不会把点积发来：vx_dok = 0)
+    if (x < NVX_LP) begin : g_dot
+      o6_vdot #(.TW(DTW), .XL(XL)) u_vdot (
+        .clk_i, .rst_ni, .flush_i, .br_upd_i,
+        .in_v_i(xb_v && xb_dot), .in_first_i(xb_first), .in_last_i(xb_last), .in_k_i(xb_k),
+        .in_raw_i(xb_raw), .in_alt_i(xb_alt), .in_lm_i(xb_lm),
+        .in_vs2_i(xb_d[0]), .in_vs1_i(xb_d[1]), .in_vdo_i(xb_s[2]), .in_pd_i(xb_pd), .in_act_i(xb_act),
+        .in_bm_i(xb_bm), .in_tag_i({xb_pd, xb_rob, xb_raw}),
+        .a_rdy_o(d_rdy), .blk_o(d_blk), .rd_o(drd), .rd_d_i(drd_d),
+        .out_v_o(dv), .out_d_o(dd), .out_tag_o(dtag), .out_ff_o(dff)
+      );
+    end else begin : g_nodot
+      assign d_rdy = 1'b0; assign d_blk = 1'b0; assign drd = '0;
+      assign dv = 1'b0; assign dd = '0; assign dtag = '0; assign dff = '0;
+    end
     // 影子级：有效 (误预测 / 冲刷作废) 与 br_mask (每拍清已解析的位)；s_rv 不管作废，只用来核对对齐
     logic [XL-1:0] s_v, s_rv;
     br_mask_t      s_bm [XL];

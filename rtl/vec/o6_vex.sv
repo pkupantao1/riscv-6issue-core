@@ -15,12 +15,16 @@
 //     16 条 64 位 fpnew 通道，向量模式 (每条一拍 4 × FP16 / 2 × FP32 / 1 × FP64)，ADDMUL 5 级 (同标量 FPU 的 6 GHz 配置)。
 //     被掩掉 / 尾部的元素送 0 (不产生异常标志)，fflags = 各通道状态之或 (只来自活动元素)。
 //   其余类别 (整数乘加、比较、加宽 / 收窄、饱和、浮点比较 / 转换 / 归约、点积 ...) 后续加入；vex_op() 给调用方判定能不能送进来
+// V7 (2026-11-19 用户定)：分两种，都是 1024 位、延迟相同 (VIQ 按固定延迟唤醒)：
+//   HP = 0 低精度合成单元：fpnew 只开 FP16 / BF16 (FP16ALT) / FP8，加整数通路 (fx_calc)；点积单元 o6_vdot 在外面同一个执行器里。
+//   HP = 1 FP64 / FP32 合成单元：fpnew 只开 FP32 / FP64，没有整数通路 (VIQ 只把 SEW 32 / 64 的浮点运算发来)
 //==============================================================================
 `default_nettype none
 module o6_vex
   import o6_pkg::*;
 #(
-  parameter int TW = 16
+  parameter int TW = 16,
+  parameter bit HP = 1'b0
 ) (
   input  wire                 clk_i,
   input  wire                 rst_ni,
@@ -136,10 +140,16 @@ module o6_vex
     return r;
   endfunction
 
-  logic [VLEN-1:0] ir_q [LAT];          // ir_q[0] = E0 之后一拍
-  always_ff @(posedge clk_i) begin
-    ir_q[0] <= fx_calc(e_raw, e_xs, e_vs2, e_vs1, e_m, e_vd, e_sew, e_nel);
-    for (int s = 1; s < LAT; s++) ir_q[s] <= ir_q[s-1];
+  logic [VLEN-1:0] ir_out;              // 整数结果 (送入后 LAT 拍)
+  if (!HP) begin : g_int
+    logic [VLEN-1:0] ir_q [LAT];        // ir_q[0] = E0 之后一拍
+    always_ff @(posedge clk_i) begin
+      ir_q[0] <= fx_calc(e_raw, e_xs, e_vs2, e_vs1, e_m, e_vd, e_sew, e_nel);
+      for (int s = 1; s < LAT; s++) ir_q[s] <= ir_q[s-1];
+    end
+    assign ir_out = ir_q[LAT-1];
+  end else begin : g_noint
+    assign ir_out = '0;                 // FP64 / FP32 单元没有整数通路
   end
 
   //--------------------------------------------------------------------------
@@ -149,19 +159,27 @@ module o6_vex
     Width:         64,
     EnableVectors: 1'b1,
     EnableNanBox:  1'b1,
-    FpFmtMask:     5'b11101,                       // [0:4] = FP32 FP64 FP16 FP8 FP16ALT
+    // [0:4] = FP32 FP64 FP16 FP8 FP16ALT。V7：低精度单元 FP16 / FP8 / BF16，FP64 / FP32 单元 FP32 / FP64
+    FpFmtMask:     HP ? 5'b11000 : 5'b00111,
     IntFmtMask:    4'b0000
   };
+  localparam fpnew_pkg::fmt_unit_types_t UT_HP =
+    '{fpnew_pkg::MERGED, fpnew_pkg::MERGED, fpnew_pkg::DISABLED, fpnew_pkg::DISABLED, fpnew_pkg::DISABLED};
+  localparam fpnew_pkg::fmt_unit_types_t UT_LP =
+    '{fpnew_pkg::DISABLED, fpnew_pkg::DISABLED, fpnew_pkg::MERGED, fpnew_pkg::MERGED, fpnew_pkg::MERGED};
   localparam fpnew_pkg::fpu_implementation_t IMPL = '{
     PipeRegs:   '{'{LF, LF, LF, LF, LF}, '{0, 0, 0, 0, 0}, '{0, 0, 0, 0, 0}, '{0, 0, 0, 0, 0}},
-    UnitTypes:  '{'{fpnew_pkg::MERGED, fpnew_pkg::MERGED, fpnew_pkg::MERGED, fpnew_pkg::DISABLED, fpnew_pkg::MERGED},
+    UnitTypes:  '{HP ? UT_HP : UT_LP,
                   '{default: fpnew_pkg::DISABLED},
                   '{default: fpnew_pkg::DISABLED},
                   '{default: fpnew_pkg::DISABLED}},
     PipeConfig: fpnew_pkg::DISTRIBUTED
   };
+  // fpnew 每条 64 位通道的子通道数 (SIMD 掩码位数) = 64 / 最窄格式宽度
+  localparam int NML = HP ? 2 : 8;
   function automatic fpnew_pkg::fp_format_e ffmt(input logic [1:0] w);
     unique case (w)
+      2'd0:    return fpnew_pkg::FP8;
       2'd1:    return fpnew_pkg::FP16;
       2'd2:    return fpnew_pkg::FP32;
       default: return fpnew_pkg::FP64;
@@ -234,14 +252,15 @@ module o6_vex
   // 各子通道 (16 位一个) 的状态掩码：只有本格式用到、且对应元素活动的子通道的状态算进 fflags。
   //   (fpnew 向量模式下所有子通道都会启动；只支持更窄格式的子通道对宽格式运算的状态是无意义的值，
   //   EnableSIMDMask = 0 时 simd_mask_i 被当成全 1，会把它们或进来 —— vfadd 曾因此多报 UF)
-  logic [3:0] fm [NFL];
+  //   子通道 j 是本格式的第 j 个元素 (字节 j × 元素宽)，本格式只有 8 / 元素宽 个
+  logic [NML-1:0] fm [NFL];
   always_comb
     for (int l = 0; l < NFL; l++)
-      unique case (e_sew)
-        2'd1:    fm[l] = {e_actb[8*l + 6], e_actb[8*l + 4], e_actb[8*l + 2], e_actb[8*l]};
-        2'd2:    fm[l] = {2'b00, e_actb[8*l + 4], e_actb[8*l]};
-        default: fm[l] = {3'b000, e_actb[8*l]};
-      endcase
+      for (int j = 0; j < NML; j++) begin
+        int ew;
+        ew = 1 << e_sew;
+        fm[l][j] = (j < 8 / ew) ? e_actb[8*l + j*ew] : 1'b0;
+      end
   for (genvar l = 0; l < NFL; l++) begin : g_fl
     fpnew_top #(
       .Features       (FEAT),
@@ -312,10 +331,15 @@ module o6_vex
       for (int b = 0; b < VLEN / 8; b++)
         out_d_o[8*b +: 8] = p_act[LAT-1][b] ? fr_q[8*b +: 8] : p_vd[LAT-1][8*b +: 8];
     else
-      out_d_o = ir_q[LAT-1];
+      out_d_o = ir_out;
   end
 
 `ifndef SYNTHESIS
+  // V7：送来的运算与单元的种类相符 (HP 只收 SEW 32 / 64 的浮点；低精度单元不收)
+  always_ff @(posedge clk_i)
+    if (rst_ni && e_v)
+      assert ((e_fp && e_sew[1]) == HP)
+        else $error("o6_vex: %s 单元收到 %h (SEW %0d，浮点 %b)", HP ? "FP64/FP32" : "低精度", e_raw, 8 << e_sew, e_fp);
   // fpnew 结果与随拍信息对齐：浮点拍进来后正好 LF 拍各通道出结果
   always_ff @(posedge clk_i)
     if (rst_ni) begin

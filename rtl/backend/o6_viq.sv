@@ -6,6 +6,7 @@
 // 存储是环形缓冲，发射后留空洞，头指针越过空洞。viq_ok_o (头到尾的跨度 <= N - W) 参与分派判定
 // M3b：向量 store 数据 uop (vms) 也在这里排队，经单独的 store 数据口 (vs_*) 发出：VX 读 src[2] 送 SQ 项 sq
 // V3：每拍至多发 NVX 条运算 (各进一个空闲的执行器，从最老的起按序分给编号小的) + 1 个 store 数据 uop。
+//   V7：SEW 32 / 64 的浮点运算只能去 VX_HP (FP64 / FP32 执行器)，其余 (整数、FP16、点积) 只能去 0..NVX_LP-1
 //   链式 (按寄存器唤醒)：源组第 0 个寄存器要已写好；第 j >= 1 个可以还在写，只要它的生产者已发射到某个执行器
 //   (vxiss：发射时整组置位，该物理寄存器再分配 (入队) 时清)。执行器的序列器第 j 拍发现它还忙就停一拍，
 //   生产者都比消费者先发射、不会反过来等，所以不会死锁
@@ -139,7 +140,8 @@ module o6_viq
           logic dn;
           dn = 1'b0;
           for (int x = 0; x < NVX; x++)
-            if (!dn && fr[x] && (!vdot_op(e[i].raw) || vx_dok_i[x]) && (!fw[i] || fwx[i] == XW'(x))) begin dn = 1'b1; fr[x] = 1'b0; xv[x] = 1'b1; xsel[x] = i; isd[i] = 1'b1; end
+            if (!dn && fr[x] && (vx_hp(e[i].raw, e[i].sew) == (x == VX_HP)) &&     // V7：按精度分执行器
+                (!vdot_op(e[i].raw) || vx_dok_i[x]) && (!fw[i] || fwx[i] == XW'(x))) begin dn = 1'b1; fr[x] = 1'b0; xv[x] = 1'b1; xsel[x] = i; isd[i] = 1'b1; end
         end
       end
     end

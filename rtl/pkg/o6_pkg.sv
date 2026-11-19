@@ -235,7 +235,11 @@ package o6_pkg;
   localparam int N_CWAKE    = N_LDP + N_ALU;
   // ROB 完成口：[0..N_ALU-1] 整数各口，[N_ALU] 长延迟口，其后 LSU 各流水、3 个浮点簇；STD 完成另走 std_done
   // 其后：VDQ 头提交时被 VECU 判非法 (I1.3b)、向量 load 预查 VPC (I2a)、最后 NVX 个：各向量执行器 (V3，O1 时 1 个)
-  localparam int NVX        = 4;                    // V3：向量执行器 (o6_vex) 个数
+  // V7 (2026-11-19 用户定)：VECU 执行器共 5 个，都是 1024 位。0..3 是低精度合成单元 (FP8 / FP16 / BF16 / INT8，含整数运算与点积)，
+  //   4 (VX_HP) 是 FP64 / FP32 合成单元。SEW = 32 / 64 的浮点运算只发给 VX_HP，其余只发给 0..3
+  localparam int NVX        = 5;                    // V3：向量执行器 (o6_vex) 个数
+  localparam int NVX_LP     = 4;                    // V7：低精度执行器个数 (编号 0..NVX_LP-1)
+  localparam int VX_HP      = NVX - 1;              // V7：FP64 / FP32 执行器的编号
   localparam int NVC        = 4;                    // V5：每拍至多提交的向量 (vea) 指令数 (第 2 条起只能是切换标记)
   localparam int N_CMPL     = N_ALU + 1 + LSU_NP + 3 + 2 + NVX;
   localparam int CM_VILL    = N_CMPL - NVX - 2;
@@ -825,6 +829,10 @@ package o6_pkg;
   function automatic logic vdot_op(input logic [31:0] i);
     return VOOO && i[6:0] == 7'b1110111 && i[31:27] == 5'b10011 && (i[14:12] == 3'b000 || i[14:12] == 3'b001) &&
            !(!i[25] && i[11:7] == 5'd0);
+  endfunction
+  // V7：发给 FP64 / FP32 执行器 (VX_HP) 的：o6_vex 的浮点运算且 SEW = 32 / 64；其余乱序运算发给低精度执行器
+  function automatic logic vx_hp(input logic [31:0] i, input logic [1:0] sew);
+    return vexf_op(i) && sew[1];
   endfunction
   function automatic logic vooo_op(input logic [31:0] i);
     return VOOO && ((vfast_op(i) && (i[14:12] == 3'b000 || i[14:12] == 3'b011 || i[14:12] == 3'b100)) || vexf_op(i) ||   // V1.2c：.vx 也收
