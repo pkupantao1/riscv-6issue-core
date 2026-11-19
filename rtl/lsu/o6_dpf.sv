@@ -51,7 +51,7 @@ module o6_dpf
   ent_t            nxt;
   logic            go;
   logic [PA_W-1:0] tgt;
-  logic [PA_W-7:0] last_pf;        // 上一个预取的行号 (去重)
+  logic [PA_W-CL_O-1:0] last_pf;   // 上一个预取的行号 (去重；M1 按 128 B 行)
   always_comb begin
     ent_t               e;
     logic signed [16:0] ns;
@@ -74,7 +74,7 @@ module o6_dpf
     d   = PA_W'($signed(e.stride)) <<< 2;       // 先符号扩展到地址宽度再移，大步长不溢出
     tgt = a_pa + d;
     if (e.stride < 16'sd64 && e.stride > -16'sd64) tgt = e.stride[15] ? a_pa - PA_W'(256) : a_pa + PA_W'(256);
-    go  = a_v && same && e.conf >= 2'd1 && tgt[PA_W-1:12] == a_pa[PA_W-1:12] && tgt[PA_W-1:6] != last_pf;
+    go  = a_v && same && e.conf >= 2'd1 && tgt[PA_W-1:12] == a_pa[PA_W-1:12] && tgt[PA_W-1:CL_O] != last_pf;
 `ifdef O6_NO_DPF
     go  = 1'b0;                        // 性能对比实验：关掉预取
 `endif
@@ -86,11 +86,11 @@ module o6_dpf
       for (int i = 0; i < NE; i++) t[i].v <= 1'b0;
     end else begin
       pf_v_o <= go;
-      if (go) last_pf <= tgt[PA_W-1:6];
+      if (go) last_pf <= tgt[PA_W-1:CL_O];
       if (a_v) t[ai] <= nxt;
     end
   end
-  always_ff @(posedge clk_i) if (go) pf_pa_o <= {tgt[PA_W-1:6], 6'b0};
+  always_ff @(posedge clk_i) if (go) pf_pa_o <= {tgt[PA_W-1:CL_O], CL_O'(0)};
 
 `ifndef SYNTHESIS
   longint st_pf = 0;

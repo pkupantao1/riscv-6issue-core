@@ -23,8 +23,8 @@ for w in $WHAT; do
       echo "unit lsu_fwd (SQ 8)：$r" | tee -a $OUT; echo "$r" | grep -q "：2 / 2" || bad=$((bad + 1))
       # 向量 ALU 槽：组合 (行为乘法器) 与 4 级流水 + DesignWare 仿真模型 (综合用的分段乘法器 / 华莱士树)，各对原写法锁步
       for v in "0:" "4:+define+O6_DW_SIM"; do
-        r=$(TAG=np${v%%:*} VDEFS="+define+VU_ALU_NP=${v%%:*} ${v#*:}" bash scripts/run_unit.sh vu_alu 1 2>&1 | grep "种子通过")
-        echo "unit vu_alu (NP ${v%%:*})：$r" | tee -a $OUT; echo "$r" | grep -q "：1 / 1" || bad=$((bad + 1))
+        r=$(TAG=np${v%%:*} VDEFS="+define+VECU_ALU_NP=${v%%:*} ${v#*:}" bash scripts/run_unit.sh vecu_alu 1 2>&1 | grep "种子通过")
+        echo "unit vecu_alu (NP ${v%%:*})：$r" | tee -a $OUT; echo "$r" | grep -q "：1 / 1" || bad=$((bad + 1))
       done
       if [ -f $ROOT/../pdk2n/cam/agesel.py ]; then
         r=$(PYTHONIOENCODING=utf-8 python3 verif/unit/agesel_xcheck.py 100000 32 | tail -1)

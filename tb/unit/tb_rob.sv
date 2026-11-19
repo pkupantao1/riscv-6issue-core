@@ -34,7 +34,7 @@ module tb_rob;
     .clk_i(clk), .rst_ni(rst_n),
     .dis_valid_i(dis_valid), .dis_uop_i(dis_uop), .dis_tval_i(dis_tval), .dis_fire_i(dis_fire),
     .dis_ready_o(dis_ready), .dis_ptr_o(dis_ptr),
-    .cmpl_i(cmpl), .std_done_i(std_done), .std_rob_i(std_rob), .head_start_i(head_start), .step_i(step_i),
+    .cmpl_i(cmpl), .std_done_i(std_done), .std_rob_i(std_rob), .vsd_done_i(1'b0), .vsd_rob_i('0), .head_start_i(head_start), .step_i(step_i),
     .viol_valid_i(viol_v), .viol_rob_i(viol_rob), .br_upd_i(bu), .flush_i(flush),
     .cm_valid_o(cm_valid), .cm_rd_valid_o(cm_rd_valid), .cm_rd_fp_o(cm_rd_fp), .cm_lrd_o(cm_lrd),
     .cm_pdst_o(cm_pdst), .cm_old_pdst_o(cm_old_pdst), .cm_mvel_o(cm_mvel), .cm_is_ld_o(cm_is_ld),
@@ -44,7 +44,8 @@ module tb_rob;
     .ev_tval_o(ev_tval), .ev_tval_sel_o(ev_tval_sel), .ev_ftq_idx_o(ev_ftq), .ev_ftq_off_o(ev_off),
     .ev_is_rvc_o(ev_is_rvc), .ev_fu_o(ev_fu), .ev_op_o(ev_op),
     .irq_pending_i(irq_pend), .irq_cause_i(irq_cause), .ev_block_i(ev_block),
-    .head_o(head), .head_go_o(head_go), .head2_o(head2), .head2_go_o(head2_go), .empty_o(empty));
+    .head_o(head), .head_go_o(head_go), .head2_o(head2), .head2_go_o(head2_go), .empty_o(empty),
+    .vacc_i(1'b0), .vreach_o(), .vreach_rob_o(), .vcm_o(), .vtrap_blk_i(1'b0));
 
   //--------------------------------------------------------------------------
   // 模型

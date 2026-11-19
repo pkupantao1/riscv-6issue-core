@@ -19,6 +19,7 @@
 `default_nettype none
 module o6_dm
   import o6_isa_pkg::*;
+  import o6_pkg::CL_O, o6_pkg::CL_B, o6_pkg::CL_W;
 (
   input  wire          clk_i,
   input  wire          rst_ni,           // 只受上电复位 (不受 ndmreset)
@@ -45,8 +46,8 @@ module o6_dm
   output logic [63:0]  mem_rdata_o,      // 组合输出，与 req 同拍
 
   // 核取指 (行读，64 B)
-  input  wire  [11:6]  line_addr_i,
-  output logic [511:0] line_data_o
+  input  wire  [11:CL_O] line_addr_i,      // M1：128 B 行
+  output logic [CL_W-1:0] line_data_o
 );
   localparam logic [11:0] A_HALTED = 12'h100, A_GOING = 12'h104, A_RESUMING = 12'h108, A_EXCEPTION = 12'h10C;
   localparam logic [11:0] A_WHERETO = 12'h300, A_ABST = 12'h338, A_PROGBUF = 12'h360, A_IMPEBREAK = 12'h380;
@@ -305,7 +306,7 @@ module o6_dm
 
   assign mem_rdata_o = {mem_word({mem_addr_i[11:3], 1'b1}), mem_word({mem_addr_i[11:3], 1'b0})};
   always_comb begin
-    for (int i = 0; i < 16; i++) line_data_o[32*i +: 32] = mem_word({line_addr_i, 4'(i)});
+    for (int i = 0; i < CL_B / 4; i++) line_data_o[32*i +: 32] = mem_word({line_addr_i, (CL_O-2)'(i)});
   end
 
   wire unused = ^cmd_q ^ ^mem_addr_i[2:0];

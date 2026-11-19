@@ -87,7 +87,7 @@ module o6_soc
   logic        dbg_haltreq;
   logic        dm_req, dm_ack;
   logic [63:0] dm_rdata, dm_rd_q;
-  logic [511:0] dm_line;
+  logic [CL_W-1:0] dm_line;
   // MBIST：核 (I$/D$) + L2
   logic        mbist_start, mbist_done, mbist_fail, core_bd, core_bf, l2_bd, l2_bf;
   assign mbist_done = core_bd && l2_bd;
@@ -106,8 +106,8 @@ module o6_soc
   // 核
   //==========================================================================
   logic            mem_req_valid, mem_req_ready, mem_req_we, mem_resp_valid, mem_resp_ready;
-  logic [PA_W-1:6] mem_req_addr;
-  logic [511:0]    mem_req_data, mem_resp_data;
+  logic [PA_W-1:CL_O] mem_req_addr;
+  logic [CL_W-1:0] mem_req_data, mem_resp_data;
   logic [3:0]      mem_req_id, mem_resp_id;
   logic            mmio_req, mmio_we, mmio_ack;
   logic [PA_W-1:0] mmio_addr;
@@ -132,22 +132,22 @@ module o6_soc
   );
 
   //==========================================================================
-  // 行请求分流：BootROM 区由 ROM 直接回 64 B，其余走 AXI
+  // 行请求分流：BootROM 区由 ROM 直接回一行 (M1：128 B)，其余走 AXI
   //==========================================================================
-  wire to_rom = ({mem_req_addr, 6'b0} < 40'h0001_1000);   // 调试区 + BootROM 窗口 (只读，写回不会落在这里)
+  wire to_rom = ({mem_req_addr, CL_O'(0)} < 40'h0001_1000);   // 调试区 + BootROM 窗口 (只读，写回不会落在这里)
   wire to_dm  = (mem_req_addr[PA_W-1:12] == '0);
 
   logic            ax_req_valid, ax_req_ready, ax_resp_valid, ax_resp_ready;
   logic [3:0]      ax_resp_id;
-  logic [511:0]    ax_resp_data;
+  logic [CL_W-1:0] ax_resp_data;
 
   // ROM 行响应 (1 项缓冲)
   logic            rl_v;
   logic [3:0]      rl_id;
-  logic [511:0]    rl_data;
-  logic [63:0]     rom_w [8];
-  for (genvar i = 0; i < 8; i++) begin : g_romw
-    o6_bootrom_comb u_rw (.addr_i({mem_req_addr[15:6], 3'(i), 3'b000}), .data_o(rom_w[i]));
+  logic [CL_W-1:0] rl_data;
+  logic [63:0]     rom_w [CL_ND];
+  for (genvar i = 0; i < CL_ND; i++) begin : g_romw
+    o6_bootrom_comb u_rw (.addr_i({mem_req_addr[15:CL_O], (CL_O-3)'(i), 3'b000}), .data_o(rom_w[i]));
   end
 
   assign ax_req_valid  = mem_req_valid && !to_rom;
@@ -163,7 +163,7 @@ module o6_soc
   always_ff @(posedge clk_i) begin
     if (mem_req_valid && to_rom && !rl_v) begin
       rl_id <= mem_req_id;
-      for (int i = 0; i < 8; i++) rl_data[64*i +: 64] <= to_dm ? dm_line[64*i +: 64] : rom_w[i];
+      for (int i = 0; i < CL_ND; i++) rl_data[64*i +: 64] <= to_dm ? dm_line[64*i +: 64] : rom_w[i];
     end
   end
 
@@ -175,8 +175,8 @@ module o6_soc
 
   // L2 (可选)
   logic            b_req_valid, b_req_ready, b_req_we, b_resp_valid, b_resp_ready;
-  logic [PA_W-1:6] b_req_addr;
-  logic [511:0]    b_req_data, b_resp_data;
+  logic [PA_W-1:CL_O] b_req_addr;
+  logic [CL_W-1:0] b_req_data, b_resp_data;
   logic [3:0]      b_req_id, b_resp_id;
 
   if (HAS_L2) begin : g_l2
@@ -259,7 +259,7 @@ module o6_soc
     .haltreq_o(dbg_haltreq), .ndmreset_o(ndmreset), .hart_unavail_i(!rst_n),
     .mem_req_i(dm_req), .mem_we_i(mmio_we), .mem_addr_i(mmio_addr[11:0]), .mem_wdata_i(mmio_wdata),
     .mem_wmask_i(mmio_wmask), .mem_rdata_o(dm_rdata),
-    .line_addr_i(mem_req_addr[11:6]), .line_data_o(dm_line)
+    .line_addr_i(mem_req_addr[11:CL_O]), .line_data_o(dm_line)
   );
 
   // 未命中任何设备的 MMIO (理论上 PMA 已挡住)：直接应答 0

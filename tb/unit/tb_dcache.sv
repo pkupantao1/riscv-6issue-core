@@ -10,20 +10,20 @@
 //   store 预取：随机地址
 //   L2：请求按到达顺序处理 (写回立即写 backing；读在请求时取快照)，随机延迟、乱序返回
 //   fence.i：周期性停发、清空后 flush_req 到 flush_done，之后 backing 必须逐字节等于 golden (所有脏行都写回了)
-// 地址：3 个组 x 24 个标签 (> 16 路)，替换 / 脏写回频繁
+// 地址：3 个组 x 40 个标签 (> 32 路，M1)，替换 / 脏写回频繁
 //   +cycles=N (默认 100000)
 //==============================================================================
 `default_nettype none
 module tb_dcache;
   import o6_pkg::*;
-  localparam int NLD = N_LDP, NM = DC_NMSHR, NT = 24;
+  localparam int NLD = N_LDP, NM = DC_NMSHR, NT = 40;
   localparam logic [PA_W-1:0] BASE = PA_W'(64'h8000_0000);
   localparam int SETS[3] = '{5, 6, 7};
 
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
 
-  logic [NLD-1:0]  ld_req = '0, ld_kill = '0;
+  logic [NLD-1:0]  ld_req = '0, ld_kill = '0, ld_wide = '0;   // M2：整行读随机开
   logic [PA_W-1:0] ld_addr [NLD], ld_paddr [NLD];
   logic [NLD-1:0]  ld_hit, ld_nack;
   logic [63:0]     ld_data [NLD];
@@ -37,24 +37,25 @@ module tb_dcache;
   logic [4:0]      st_op = '0;
   logic [1:0]      st_size = '0;
   logic            st_done;
-  logic [511:0]    st_lrdata;
+  logic [CL_W-1:0] st_lrdata;
   logic            pf_req = 0, flush_req = 0, flush_done;
   logic [PA_W-1:0] pf_paddr = '0;
   logic            mreq_v, mreq_rdy = 0, mreq_we, mresp_v = 0, mresp_rdy;
-  logic [PA_W-1:6] mreq_addr;
-  logic [511:0]    mreq_data, mresp_data = '0;
+  logic [PA_W-1:CL_O] mreq_addr;
+  logic [CL_W-1:0] mreq_data, mresp_data = '0;
   logic [3:0]      mreq_id, mresp_id = '0;
   logic            bist_done, bist_fail;
 
   o6_dcache dut (
     .clk_i(clk), .rst_ni(rst_n),
-    .ld_req_i(ld_req), .ld_addr_i(ld_addr), .ld_paddr_i(ld_paddr), .ld_kill_i(ld_kill),
+    .ld_req_i(ld_req), .ld_addr_i(ld_addr), .ld_wide_i(ld_wide), .ld_line_o(), .ld_paddr_i(ld_paddr), .ld_kill_i(ld_kill),
     .ld_hit_o(ld_hit), .ld_nack_o(ld_nack), .ld_data_o(ld_data), .ld_mshr_o(ld_mshr),
     .refill_o(refill), .refill_mshr_o(refill_mshr),
     .st_req_i(st_req), .st_paddr_i(st_paddr), .st_next_paddr_i(st_next), .st_lk_paddr_i(st_paddr),
     .st_data_i(st_data), .st_mask_i(st_mask), .st_amo_i(st_amo), .st_amo_op_i(st_op), .st_size_i(st_size),
     .st_done_o(st_done), .st_rdata_o(st_rdata),
     .st_line_i(1'b0), .st_ldata_i('0), .st_lmask_i('0), .st_lrdata_o(st_lrdata),
+    .v_req_i(1'b0), .v_paddr_i('0), .v_ln_i('0), .v_next_paddr_i('0), .v_we_i(1'b0), .v_wdata_i('{default: '0}), .v_wmask_i('{default: '0}), .v_ack_o(), .v_rv_o(), .v_rdata_o(),   // 向量行口 (P2.1)：本 TB 不驱动
     .pf_req_i(pf_req), .pf_paddr_i(pf_paddr), .flush_req_i(flush_req), .flush_done_o(flush_done),
     .mem_req_valid_o(mreq_v), .mem_req_ready_i(mreq_rdy), .mem_req_we_o(mreq_we), .mem_req_addr_o(mreq_addr),
     .mem_req_data_o(mreq_data), .mem_req_id_o(mreq_id),
@@ -67,16 +68,16 @@ module tb_dcache;
   logic [7:0] golden [logic [PA_W-1:0]];
   logic [7:0] backing [logic [PA_W-1:0]];
   function automatic logic [PA_W-1:0] mk(int s, int t, int off);
-    return BASE + PA_W'(t * 4096 + SETS[s] * 64 + off);
+    return BASE + PA_W'(t * 4096 + SETS[s] * CL_B + off);
   endfunction
   function automatic logic [63:0] g_dw(logic [PA_W-1:0] a);   // golden 里 a 所在双字
     logic [63:0] r;
     for (int b = 0; b < 8; b++) r[8*b +: 8] = golden[{a[PA_W-1:3], 3'b000} + b];
     return r;
   endfunction
-  function automatic logic [511:0] b_line(logic [PA_W-1:6] l);
-    logic [511:0] r;
-    for (int b = 0; b < 64; b++) r[8*b +: 8] = backing.exists({l, 6'd0} + b) ? backing[{l, 6'd0} + b] : 8'h00;
+  function automatic logic [CL_W-1:0] b_line(logic [PA_W-1:CL_O] l);
+    logic [CL_W-1:0] r;
+    for (int b = 0; b < CL_B; b++) r[8*b +: 8] = backing.exists({l, CL_O'(0)} + b) ? backing[{l, CL_O'(0)} + b] : 8'h00;
     return r;
   endfunction
 
@@ -99,7 +100,7 @@ module tb_dcache;
   typedef struct { logic [PA_W-1:0] a; logic [63:0] d; logic [7:0] m; bit amo; logic [4:0] op; logic [1:0] sz; } st_t;
   st_t sq[$];
   // L2 读请求
-  typedef struct { int id; logic [511:0] d; int t; } rd_t;
+  typedef struct { int id; logic [CL_W-1:0] d; int t; } rd_t;
   rd_t rq[$];
   bit  quiet;                         // fence.i 前停发
   logic [2:0] s_st_q = '0;
@@ -248,6 +249,7 @@ module tb_dcache;
     // L0：先重发，再发新的；口 0 偶尔对准「SQ 头的 store 下一拍查标签」发同一行的 load (#18：两者缺失同拍分配)
     for (int k = 0; k < NLD; k++) begin
       ld_req[k] = 0;
+      ld_wide[k] = $urandom_range(99) < 30;
       if (k == 0 && !quiet && sq.size() > 0 && !sq[0].amo && dut.s_st == 3'd0 && $urandom_range(99) < 40) begin
         logic [PA_W-1:0] a;
         a = {sq[0].a[PA_W-1:6], 3'(sq[0].a[5:3] + 3'd1), 3'b000};
@@ -299,11 +301,11 @@ module tb_dcache;
     // 组合量要在本拍输入都驱动之后采 (negedge 刚到时 DUT 看到的还是上拍的输入)
     if (dut.st_miss_alloc) for (int k = 0; k < NLD; k++)
       // 修复后同行 load 直接合并到 store 本拍新分配的 MSHR (l1_alloc 为 0)，所以按「L1 缺失且同行」判
-      if (dut.l1_v[k] && dut.l1_go[k] && !ld_kill[k] && !(|dut.l1_hit_oh[k]) && ld_paddr[k][PA_W-1:6] == dut.spa_q[PA_W-1:6]) c_same = 1;
+      if (dut.l1_v[k] && dut.l1_go[k] && !ld_kill[k] && !(|dut.l1_hit_oh[k]) && ld_paddr[k][PA_W-1:CL_O] == dut.spa_q[PA_W-1:CL_O]) c_same = 1;
     c_pf = dut.pf_alloc;
     if (mreq_v && mreq_rdy) begin
       if (mreq_we) begin
-        for (int b = 0; b < 64; b++) backing[{mreq_addr, 6'd0} + b] = mreq_data[8*b +: 8];
+        for (int b = 0; b < CL_B; b++) backing[{mreq_addr, CL_O'(0)} + b] = mreq_data[8*b +: 8];
         c_wb = 1;
         if (dut.x_st != 0) c_flushd = 1;
       end else begin

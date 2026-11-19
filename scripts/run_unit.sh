@@ -13,12 +13,15 @@ case $N in
   rob)      DUT="rtl/backend/o6_rob.sv"; TOP=tb_rob; HIER="tb_rob.dut" ;;
   mmu)      DUT="rtl/mmu/o6_pmp.sv rtl/mmu/o6_ptw.sv rtl/mmu/o6_tlb.sv"; TOP=tb_mmu; HIER="tb_mmu.u_ptw tb_mmu.u_itlb tb_mmu.u_dtlb" ;;
   dcache)   DUT="rtl/common/o6_mbist.sv rtl/common/o6_sram_sp.sv rtl/cache/o6_dcache.sv"; TOP=tb_dcache; HIER="tb_dcache.dut"; EXCL="o6_sram_sp" ;;
-  # 向量 ALU 槽：新写法 vs 原写法 (tb/unit/o6_vu_alu_ref.sv) 锁步；o6_vu.sv 里引用 fpnew，带上 cvfpu
-  vu_alu)   DUT="$(tr '\n' ' ' < $ROOT/rtl/fpu/cvfpu.f) rtl/vec/o6_vu.sv tb/unit/o6_vu_alu_ref.sv"; TOP=tb_vu_alu; HIER="tb_vu_alu"
+  # 向量 ALU 槽：新写法 vs 原写法 (tb/unit/o6_vecu_alu_ref.sv) 锁步；o6_vecu.sv 里引用 fpnew，带上 cvfpu
+  vecu_alu)   DUT="$(tr '\n' ' ' < $ROOT/rtl/fpu/cvfpu.f) rtl/vec/o6_vecu.sv tb/unit/o6_vecu_alu_ref.sv"; TOP=tb_vecu_alu; HIER="tb_vecu_alu"
             VDEFS="$VDEFS +incdir+$SRC/third_party/cvfpu/src/common_cells/include"
             # O6_DW_SIM：乘法器走 DesignWare 仿真模型 (sim_ver 里的 VCS 版靠 `include "vcs/..."，要 incdir)
             DWSV=/export/SoftWare/Synopsys/syn/O-2018.06-SP1/dw/sim_ver
             case "$VDEFS" in *O6_DW_SIM*) VDEFS="$VDEFS -y $DWSV +libext+.v +incdir+$DWSV" ;; esac ;;
+  # 向量执行器 VL (V1，docs/11 §9h)：整数 (独立参考模型) / FP32 加乘 (shortreal) / FP64 乘加 (整数值，精确)
+  vex)      DUT="$(tr '\n' ' ' < $ROOT/rtl/fpu/cvfpu.f) rtl/vec/o6_vex.sv"; TOP=tb_vex; HIER="tb_vex.dut"
+            VDEFS="$VDEFS +incdir+$SRC/third_party/cvfpu/src/common_cells/include" ;;
   # 乘法器：VDEFS="+define+O6_DW_SIM [+define+O6_MUL_SEGW=N]" 走 DW02_multp / DW02_tree 仿真模型
   mul)      DUT="rtl/exu/o6_mul.sv"; TOP=tb_mul; HIER="tb_mul.dut"
             DWSV=/export/SoftWare/Synopsys/syn/O-2018.06-SP1/dw/sim_ver

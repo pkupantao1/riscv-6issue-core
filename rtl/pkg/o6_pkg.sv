@@ -30,6 +30,14 @@ package o6_pkg;
 `else
   localparam int VDLEN      = 256;
 `endif
+  // 向量访存每拍最多几行 (P3，docs/11 §7a)：D$ 数据按行号低 2 位分 4 组，连续的 VM_NL (<= 4) 行必在不同组，
+  //   一拍同时读 / 写；3 行 = 192 B/拍 = SiFive P870 L1 (3 个访存口 x 16 B) 的 4 倍。1 = P2 的每拍一行
+//   U (11-17，docs/11 §7b)：统一 4 行槽 = 256 B/拍，向量一拍 4 行 (占满 4 个行组)，标量 load 与它同行时搭同一次读
+`ifdef O6_VM_NL
+  localparam int VM_NL      = `O6_VM_NL;
+`else
+  localparam int VM_NL      = 4;
+`endif
   localparam int FETCH_BYTES = 32;  // 取指块
   localparam int FETCH_HW   = FETCH_BYTES / 2;   // 一个取指块里的 16 位槽数 (16)
 
@@ -39,6 +47,11 @@ package o6_pkg;
   // ROB 扩到 258 项后在途写寄存器的指令可达 ~180 条：整数 256 / 浮点 192 (2026-10-13，原 192 / 160)
   localparam int N_IPREG    = 256;
   localparam int N_FPREG    = 192;
+`ifdef O6_NVPREG
+  localparam int N_VPREG    = `O6_NVPREG;   // 实验用 (PREG_W = 8，至多 256)
+`else
+  localparam int N_VPREG    = 192;  // 向量物理寄存器 (VLEN 位)：32 架构 + 160 在途改名 (docs/11_vector_uarch.md §3，2026-11-16)
+`endif
   localparam int PREG_W     = 8;
   // 在途未决分支 (条件分支 + JALR)。16 -> 32 (2026-10-13)：t50 CoreMark 重命名停顿中"分支标签用完"占全程 36%
 `ifdef O6_MAX_BR
@@ -98,6 +111,12 @@ package o6_pkg;
   localparam int DC_NMSHR   = 15;
   localparam int MSHR_W     = 4;
   localparam logic [3:0] MEM_ID_IC = 4'hF;
+  // M1 (docs/11 §9g，2026-11-18 用户定)：数据侧 cache 行长 128 B (L1D / L2 / L1<->L2 接口 / 总线突发)。
+  //   一个 D$ 行槽一拍读写一整行 = 一个向量寄存器 (VLEN 1024)。I$ 仍按 64 B 取指块向 L2 要 (L2 回半行)
+  localparam int CL_O       = 7;               // 行内偏移位数
+  localparam int CL_B       = 1 << CL_O;       // 128 B
+  localparam int CL_W       = 8 * CL_B;        // 1024 位
+  localparam int CL_ND      = CL_B / 8;        // 每行 16 个双字
 
   //--------------------------------------------------------------------------
   // 发射队列与端口
@@ -172,8 +191,39 @@ package o6_pkg;
   localparam int N_IWB      = N_ALU + 1 + N_LDP;
   // 浮点 PRF 写口：FW0/FW1 = 浮点两口，FW2 = I2F，FW3.. = 各 load 流水的 FLD
   localparam int N_FWB      = 3 + N_LDP;
-  // 整数 PRF 读口：整数各口 2 个，LSU 各流水 1 个 (基址)，STD 口各 1 个
-  localparam int N_IRD      = 2 * N_ALU + LSU_NP + N_STDP;
+  // 整数 PRF 读口：整数各口 2 个，LSU 各流水 1 个 (基址)，STD 口各 1 个，向量指令队列头 1 个 (I1.3b，提交送 VECU 的 x[rs1])
+  localparam int N_IRD      = 2 * N_ALU + LSU_NP + N_STDP + 1;
+  // I1.3b：纯向量运算在提交时送 VECU (默认开；+define+O6_NO_VEARLY 回到 ROB 头经 P3 发请求)
+`ifdef O6_NO_VEARLY
+  localparam bit VEARLY     = 1'b0;
+`else
+  localparam bit VEARLY     = 1'b1;
+`endif
+  // 向量指令队列深度 (分派时空位 >= W 才分派整组)。I2a：vel 也进 VDQ，gemm 每遍 9 条 (8 vfmacc + vle)，16 项时下一遍
+  //   分派不进来 (要 <= 10 项)，提交流断档 -> 32
+`ifdef O6_VDQ_N
+  localparam int VDQ_N      = `O6_VDQ_N;
+`else
+  localparam int VDQ_N      = 64;   // V5：32 -> 64 (每拍提交 4 条后 VDQ / VIQ 满成了分派停顿的主因，gemm_rb 9491 -> 8602 拍)
+`endif
+  // I2a：单位步长类向量 load 预查后提前提交 (要 VEARLY；+define+O6_NO_VEL 关)。VEL_SPAN = 预查的字节数 (最大寄存器组 8 × VLEN/8)
+`ifdef O6_NO_VEL
+  localparam bit VEL        = 1'b0;
+`else
+  localparam bit VEL        = VEARLY;
+`endif
+  localparam int VEL_SPAN   = 8 * (VLEN / 8);
+  // O1 核内向量乱序 (docs/11 §9f)：单宽度整数逐元素运算 (.vv / .vi，LMUL <= 1) 在重命名级分到核内的向量物理寄存器，
+  //   进核内向量发射队列 VIQ，源就绪即乱序发射到 VECU 的 VX 流水 (推测执行，按物理号读写)。要 VEARLY；+define+O6_NO_VOOO 关。
+  //   物理寄存器分两个池：核内 [0, VCP) (含复位时 v0..v31 的 0..31，重命名分配 / 提交后经 VECU 回收)，
+  //   VECU 内 [VCP, N_VPREG) (I2b 异步 load 在 VECU 里改名用)。物理寄存器回收时按号码回各自的池
+`ifdef O6_NO_VOOO
+  localparam bit VOOO       = 1'b0;
+`else
+  localparam bit VOOO       = VEARLY;
+`endif
+  localparam int VNP        = 48;                // VECU 池 (I2c 两个 m8 改名在途要 16 个，另可能有至多 32 个被映射)
+  localparam int VCP        = N_VPREG - VNP;     // 核内池 144 个 (32 个复位映射 + 112 个可推测分配)
   localparam int N_FRD      = 7;
   // 唤醒：整数 [0..N_ALU-1] 各整数口 (含 MUL)，[N_ALU] 长延迟口，其后 load；浮点 [0..2] 浮点簇，[3..] load
   localparam int N_IWAKE    = N_ALU + 1 + N_LDP;
@@ -184,7 +234,13 @@ package o6_pkg;
   localparam int N_IWAKE_C  = N_IWAKE + N_ALU;
   localparam int N_CWAKE    = N_LDP + N_ALU;
   // ROB 完成口：[0..N_ALU-1] 整数各口，[N_ALU] 长延迟口，其后 LSU 各流水、3 个浮点簇；STD 完成另走 std_done
-  localparam int N_CMPL     = N_ALU + 1 + LSU_NP + 3;
+  // 其后：VDQ 头提交时被 VECU 判非法 (I1.3b)、向量 load 预查 VPC (I2a)、最后 NVX 个：各向量执行器 (V3，O1 时 1 个)
+  localparam int NVX        = 4;                    // V3：向量执行器 (o6_vex) 个数
+  localparam int NVC        = 4;                    // V5：每拍至多提交的向量 (vea) 指令数 (第 2 条起只能是切换标记)
+  localparam int N_CMPL     = N_ALU + 1 + LSU_NP + 3 + 2 + NVX;
+  localparam int CM_VILL    = N_CMPL - NVX - 2;
+  localparam int CM_VPC     = N_CMPL - NVX - 1;
+  localparam int CM_VX      = N_CMPL - NVX;         // CM_VX + e：执行器 e
   localparam int N_STD      = N_STDP + 1;
 
   //--------------------------------------------------------------------------
@@ -235,6 +291,15 @@ package o6_pkg;
     logic [53:0] lo, hi;
   } pmp_dec_t;
 
+  // O1 (docs/11 §9f)：核内乱序向量 uop 的一个向量源。cr = 1：按 VECU 的提交态映射 crat[ar] 读 (最近写它的是不在核内改名的
+  //   指令，重命名时已确认它做完)；cr = 0：读物理寄存器 p (核内改名的生产者，忙表跟踪)
+  typedef struct packed {
+    logic        use_;
+    logic        cr;
+    logic [4:0]  ar;
+    logic [PREG_W-1:0] p;
+  } vsrc_t;
+
   // 寄存器类
   typedef enum logic [1:0] {
     RC_NONE = 2'd0,
@@ -258,7 +323,7 @@ package o6_pkg;
     FU_FDIV = 4'd11,   // FDIV / FSQRT
     FU_I2F  = 4'd12,   // FCVT.*.[W|L] / FMV.*.X，读整数写浮点
     FU_STD  = 4'd13,   // store 数据半边 (分派时由 FU_ST 拆出；FU_ST 在 IQ 里只表示 STA)
-    FU_VEC  = 4'd14,   // 向量指令 (RVV)：ROB 头经 P3 交给向量单元 (o6_vu)，见 docs/11_vector_uarch.md
+    FU_VEC  = 4'd14,   // 向量指令 (RVV)：ROB 头经 P3 交给向量单元 (o6_vecu)，见 docs/11_vector_uarch.md
     FU_NONE = 4'd15    // 无需执行 (NOP 化的指令，或译码即异常)
   } fu_e;
 
@@ -528,6 +593,59 @@ package o6_pkg;
     //   mvc：译码器认出的候选，mvsrc：源是 rs2 (否则 rs1)；mvel：译码级确定消除 (fu 已改成 FU_NONE)，
     //   重命名把 rd 直接映射到源的物理寄存器，不分配新的，不进发射队列，分派即完成
     logic                 mvc, mvsrc, mvel;
+    // O1 (docs/11 §9f)：重命名级定为核内乱序的向量 uop (pdst = 向量物理寄存器)。原 I1.2 "ROB 头快路径" 的含义已不用
+    logic                 vfast;
+    // I1.3b 提交送 VECU (docs/11 §9d)：纯向量运算 (无标量结果、不访存、不改 vtype)。fu 改成 FU_NONE (不进发射队列、分派即完成)，
+    //   进核里的向量指令队列 VDQ；到 ROB 头提交时读标量源 (psrc1) 送 VECU 的提交口，VECU 判合法且能入队才提交
+    logic                 vea;
+    // I2a (docs/11 §9e)：预查后提前提交的向量 load (vel_op)。vea 同时置 1 (进 VDQ、提交时送 VECU)，但 fu 仍是 FU_VEC：
+    //   P3 在源就绪时发射 (不等 ROB 头)，EX 级把基址送 LSU 的 VPC 预查，VPC 经最后一个完成口完成它 (不通过则 replay)
+    logic                 vel;
+    // O1 核内向量乱序 (docs/11 §9f)。译码：vfc = 乱序候选 (vfast_op 且 .vv / .vi、当前 vtype 合法、LMUL <= 1、vstart = 0)，
+    //   vvl / vsew = 译码时 VECU 的 vl / SEW (之后 vsetvl 改了它们就冲刷)；vnw = 写向量寄存器的指令 (vwd 起保守的 vwn 个)。
+    //   重命名：候选的源与目的都没有在途的 "不在核内改名的写" 时定为乱序 (vfast = 1，pdst = 新分配的向量物理寄存器，
+    //   vps = {vs2, vs1, vd 旧值, v0})；否则仍按 vea 提交后在 VECU 里按序做，并算作在途写 (vnw)
+    logic                 vfc;
+    logic [10:0]          vvl;
+    logic [1:0]           vsew;
+    logic                 vnw;
+    logic [4:0]           vwd;
+    logic [3:0]           vwn;
+    vsrc_t [3:0]          vps;
+    // M3 (docs/11 §9g)：向量单位步长访存在译码级展开成 {检查 uop (vel = 1、vea = 0，VPC 预查)、每寄存器一个数据 uop}。
+    //   vml：向量 load 数据 uop (FU_LD，地址 = 基址 + imm，有效字节 vnb，目的 = 寄存器 vwd 的新物理寄存器 pdst，
+    //   vps[2] = vd 旧值 (vnb < 128 时补尾部))。vgrp：属于一条展开的指令；vmid：不是其中第一个 (ROB 头不接中断)；vlast：最后一个
+    logic                 vml;
+    // M3b：向量 store 数据 uop (FU_ST：地址半边照常进 IQ_S / STA，窗口 [基址 + imm, + vnb)；数据半边不进 IQ_D，
+    //   由 VIQ 发到 VX 读 vps[2] = 寄存器 vwd 的当前值，整寄存器 (128 B) 写进 SQ 项)。vfast = 1 (进 VIQ) 但不分配 pdst
+    logic                 vms;
+    // M4a：带掩码 (vm = 0) 的单位步长访存。vk = 组里第几个寄存器，veb = 元素宽度 log2 (字节)，
+    //   掩码位 = v0[vk × (128 >> veb) + 字节号 >> veb]；v0 的源在 vps[3]
+    logic                 vmk;
+    logic [2:0]           vk;
+    logic [1:0]           veb;
+    // V1.2b (docs/11 §9h)：乱序向量运算整条发射 (不拆 uop)，寄存器组 vng 个 (1..8)。
+    //   vpg[k][j] = 源 k (0 vs2 / 1 vs1 / 2 vd 旧值) 组里第 j 个寄存器的映射 (vps[k] = vpg[k][0])；v0 仍在 vps[3]；
+    //   vpd[j] = 目的组第 j 个寄存器新分配的物理寄存器 (pdst = vpd[0])
+    logic [3:0]           vng;
+    // V1.2c：带标量源 (.vx / .vf) 的乱序候选：分派时另派一个数据半边 (STD，整数进 IQ_D / 浮点进 IQ_F) 读 x / f[rs1]，
+    //   按 ROB 号送进 VIQ 的表项 (rs2_class / lrs2 = rs1 的类 / 号)；重命名降级成原路径时数据半边照发，结果没人收
+    logic                 vxs;
+    // V3：不读 vd 旧值 (不带掩码、vl = VLMAX、LMUL >= 1、不是乘加：没有尾部 / 被掩掉的元素，也不累加)。
+    //   否则连续写同一个 vd 的独立指令 (WAW) 因为读旧值变成了 RAW，排成一串
+    logic                 vnod;
+    // V4 点积 (vqwdota* / vfqwdota*)：源组 vns 个寄存器 (= LMUL)，目的只有 vd 一个 (vng = 1)；其余运算 vns = vng。
+    //   vlm = 译码时的 LMUL 编码 (点积的 guard 位数 = log2 VLMAX)，valt = vtype.altfmt (选 FP8 / 整数格式)
+    logic [3:0]           vns;
+    logic [2:0]           vlm;
+    logic                 valt;
+    // V5 快 vset：vtype 不变、vl 预计不变的 vsetvli 改成 ALU_MINU (rd = min(avl, VLMAX))，结果 != VLMAX (vl 要变) 时 replay，
+    //   重取后走原来在 ROB 头经 VECU 的同步路径
+    logic                 vsetf;
+    vsrc_t [2:0][7:0]     vpg;
+    preg_t [7:0]          vpd;
+    logic                 vgrp, vmid, vlast;
+    logic [7:0]           vnb;
     // 重命名
     preg_t                pdst, psrc1, psrc2, psrc3, old_pdst;
     logic                 src1_busy, src2_busy, src3_busy;
@@ -610,6 +728,137 @@ package o6_pkg;
   //==========================================================================
   // 函数
   //==========================================================================
+
+  // 向量快路径的指令 (docs/11 §9a，I1.2)：只看编码。OP-V 的 OPIVV / OPIVX / OPIVI，单宽度整数逐元素运算：
+  //   vadd vsub vrsub vminu vmin vmaxu vmax vand vor vxor vsll vsrl vsra vmerge / vmv.v。
+  //   排除保留编码 (各运算没有的 funct3 形式、vmv.v 的 vs2 != 0) 与 "带掩码且 vd = v0" (目的与掩码重叠，保留)。
+  //   还要当前 vtype 合法、LMUL <= 1、vstart = 0 (o6_vecu 的 fast_ok_o)，在译码级与这里相与
+  function automatic logic vfast_op(input logic [31:0] i);
+    logic [5:0] f6;
+    logic [2:0] f3;
+    logic       vv, vx, vi, ok;
+    f6 = i[31:26]; f3 = i[14:12];
+    vv = (f3 == 3'b000); vx = (f3 == 3'b100); vi = (f3 == 3'b011);
+    unique case (f6)
+      6'b000000, 6'b001001, 6'b001010, 6'b001011,                 // vadd vand vor vxor
+      6'b100101, 6'b101000, 6'b101001: ok = vv || vx || vi;       // vsll vsrl vsra
+      6'b000010, 6'b000100, 6'b000101, 6'b000110, 6'b000111:     // vsub vminu vmin vmaxu vmax
+                                       ok = vv || vx;
+      6'b000011:                       ok = vx || vi;             // vrsub
+      6'b010111:                       ok = (vv || vx || vi) && (!i[25] || i[24:20] == 5'd0);   // vmerge / vmv.v
+      default:                         ok = 1'b0;
+    endcase
+    return (i[6:0] == 7'b1010111) && ok && !(!i[25] && i[11:7] == 5'd0);
+  endfunction
+
+  // I1.3b 提交送 VECU 的指令 (docs/11 §9d)：只看编码。OP-V 里除 vsetvl* (funct3 = 111) 与写标量结果的
+  //   VWXUNARY0 (OPMVV funct6 = 010000：vmv.x.s / vcpop.m / vfirst.m)、VWFUNARY0 (OPFVV funct6 = 010000：vfmv.f.s) 以外的全部，
+  //   加 OP-VE (点积)。它们只读一个标量源 (rs1，整数或浮点)，不访存、不改 vtype / vl / vstart、没有标量结果。
+  //   合法性 (与 vtype 有关) 在提交时由 VECU 判；非法的报非法指令异常
+  function automatic logic vea_op(input logic [31:0] i);
+    logic [2:0] f3;
+    f3 = i[14:12];
+    if (i[6:0] == 7'b1110111) return 1'b1;                                   // OP-VE
+    if (i[6:0] != 7'b1010111) return 1'b0;
+    if (f3 == 3'b111) return 1'b0;                                           // vsetvl*
+    if (i[31:26] == 6'b010000 && (f3 == 3'b010 || f3 == 3'b001)) return 1'b0; // 写 x / f 的 rd
+    return 1'b1;
+  endfunction
+
+  // I2a 预查后提前提交的向量 load (docs/11 §9e)：单位步长类 load (mew = 0、mop = 00，lumop = 单位步长 / 整寄存器 / 掩码 /
+  //   fault-only-first，含分段)。发射时 LSU 的 VPC 按 [基址, 基址 + VEL_SPAN) 预查翻译 / PMA / PMP，通过则像 vea 一样在提交时送 VECU
+  //   (访存在提交后异步做)；不通过则 replay，重取后按原路径在 ROB 头同步执行 (报精确异常)
+  function automatic logic vel_op(input logic [31:0] i);
+    if (i[6:0] != 7'b0000111) return 1'b0;
+    if (!(i[14:12] == 3'b000 || i[14:12] == 3'b101 || i[14:12] == 3'b110 || i[14:12] == 3'b111)) return 1'b0;
+    if (i[28] || i[27:26] != 2'b00) return 1'b0;
+    // O1：fault-only-first 会改 vl，而乱序 uop 用译码时的 vl -> 不提前提交，按原路径在 ROB 头做 (截了 vl 时 VECU 要求冲刷)
+    return i[24:20] == 5'b00000 || i[24:20] == 5'b01000 || i[24:20] == 5'b01011 || (!VOOO && i[24:20] == 5'b10000);
+  endfunction
+
+  // M3 (docs/11 §9g)：译码展开进共用 LSU 的向量 load 的种类：0 不是，1 单位步长 (NF = 1)，2 整寄存器，3 掩码 (vlm)。
+  //   都要不带掩码 (vm = 1)、mew = 0；EEW 宽度编码 000 / 101 / 110 / 111
+  //   M4a：单位步长 (种类 1) 也收带掩码的 (vm = 0)；带掩码且 vd = v0 是保留编码，不展开 (原路径照原样处理)。
+  //   整寄存器与掩码 load 只有 vm = 1 的编码
+  function automatic logic [1:0] vml_kind(input logic [31:0] i);
+    if (!VOOO) return 2'd0;
+    if (i[6:0] != 7'b0000111 || i[28] || i[27:26] != 2'b00) return 2'd0;
+    if (!(i[14:12] == 3'b000 || i[14:12] == 3'b101 || i[14:12] == 3'b110 || i[14:12] == 3'b111)) return 2'd0;
+    if (i[24:20] == 5'b00000 && i[31:29] == 3'd0 && (i[25] || i[11:7] != 5'd0)) return 2'd1;
+    if (!i[25]) return 2'd0;
+    if (i[24:20] == 5'b01000 && (i[31:29] == 3'd0 || i[31:29] == 3'd1 || i[31:29] == 3'd3 || i[31:29] == 3'd7)) return 2'd2;
+    if (i[24:20] == 5'b01011 && i[31:29] == 3'd0 && i[14:12] == 3'b000) return 2'd3;
+    return 2'd0;
+  endfunction
+  // M3b：同上，向量 store (STORE-FP)：1 单位步长 vse<eew> (NF = 1，M4a 起可带掩码)，2 整寄存器 vs<nr>r (宽度编码只能 000)，3 vsm
+  function automatic logic [1:0] vms_kind(input logic [31:0] i);
+    if (!VOOO) return 2'd0;
+    if (i[6:0] != 7'b0100111 || i[28] || i[27:26] != 2'b00) return 2'd0;
+    if (!(i[14:12] == 3'b000 || i[14:12] == 3'b101 || i[14:12] == 3'b110 || i[14:12] == 3'b111)) return 2'd0;
+    if (i[24:20] == 5'b00000 && i[31:29] == 3'd0) return 2'd1;
+    if (!i[25]) return 2'd0;
+    if (i[24:20] == 5'b01000 && i[14:12] == 3'b000 &&
+        (i[31:29] == 3'd0 || i[31:29] == 3'd1 || i[31:29] == 3'd3 || i[31:29] == 3'd7)) return 2'd2;
+    if (i[24:20] == 5'b01011 && i[31:29] == 3'd0 && i[14:12] == 3'b000) return 2'd3;
+    return 2'd0;
+  endfunction
+  // M4a：带掩码访存的字节掩码。寄存器组里第 k 个寄存器、元素宽度 2^eb 字节：字节 b 属于元素 k × (128 >> eb) + (b >> eb)
+  function automatic logic [CL_B-1:0] vmbytes(input logic [VLEN-1:0] v0, input logic [2:0] k, input logic [1:0] eb);
+    logic [CL_B-1:0] m;
+    for (int b = 0; b < CL_B; b++) m[b] = v0[(int'(k) * (CL_B >> eb)) + (b >> eb)];
+    return m;
+  endfunction
+
+  // O1 乱序候选的编码形式 (在 vfast_op 之上)：只要 .vv / .vi (.vx 的标量源要整数唤醒，后续再加)
+  // V1.2a (docs/11 §9h)：o6_vex 能做的浮点运算 (OPFVV)：vfadd vfsub vfmul 与 8 种乘加 (funct6 = 101xxx)。
+  //   带掩码且 vd = v0 是保留编码。SEW = 8、frm 非法、FS = Off 时不合法，由译码级另判 (仍按原路径报非法指令)
+  function automatic logic vexf_op(input logic [31:0] i);
+    logic [5:0] f6;
+    f6 = i[31:26];
+    return VOOO && i[6:0] == 7'b1010111 && (i[14:12] == 3'b001 || i[14:12] == 3'b101) &&      // V1.2c：.vf 也收
+           (f6 == 6'b000000 || f6 == 6'b000010 || f6 == 6'b100100 || f6[5:3] == 3'b101 ||
+            (f6 == 6'b100111 && i[14:12] == 3'b101)) &&                                             // vfrsub 只有 .vf
+           !(!i[25] && i[11:7] == 5'd0);
+  endfunction
+  // V4 点积 (OP-VE)：vqwdotau (f6 100110, OPIVV) / vqwdotas (100111, OPIVV) / vfqwdota (100110, OPFVV) / vfqwdota_alt (100111, OPFVV)。
+  //   vd[0] (32 位) += sum vs1[i] * vs2[i]；带掩码时 vd 不能是 v0 (require_vm)。SEW = 8 才走核内 (译码判)
+  function automatic logic vdot_op(input logic [31:0] i);
+    return VOOO && i[6:0] == 7'b1110111 && i[31:27] == 5'b10011 && (i[14:12] == 3'b000 || i[14:12] == 3'b001) &&
+           !(!i[25] && i[11:7] == 5'd0);
+  endfunction
+  function automatic logic vooo_op(input logic [31:0] i);
+    return VOOO && ((vfast_op(i) && (i[14:12] == 3'b000 || i[14:12] == 3'b011 || i[14:12] == 3'b100)) || vexf_op(i) ||   // V1.2c：.vx 也收
+                    vdot_op(i));
+  endfunction
+
+  // O1：指令是否写向量寄存器，及保守的目的组 {vd, 个数} (只用于 "在途写" 的相关判断，宁多勿少)。
+  //   sew / lmul = 译码时的 vtype。OP-V / OP-VE：除 vsetvl* 与写标量结果的以外都写，个数 = min(8, 2 * 组大小)
+  //   (加宽的目的是 2 倍)，vmv<nr>r 按 8；向量 load：EMUL * NF (整寄存器 NF，掩码 1)，至多 8
+  function automatic logic [4:0] vwr_n(input logic [31:0] i, input logic [1:0] sew, input logic [2:0] lmul);
+    int g, lg, eg, n;
+    lg = lmul[2] ? 0 : int'(lmul);                                     // 小数 LMUL 按 1 个寄存器
+    g  = 1 << lg;
+    if (i[6:0] == 7'b1110111) return 5'((2 * g > 8) ? 8 : 2 * g);      // OP-VE (点积)
+    if (i[6:0] == 7'b1010111) begin
+      if (i[14:12] == 3'b111) return 5'd0;                             // vsetvl*
+      if (i[31:26] == 6'b010000 && (i[14:12] == 3'b010 || i[14:12] == 3'b001)) return 5'd0;   // vmv.x.s / vcpop / vfirst / vfmv.f.s
+      if (i[31:26] == 6'b100111 && i[14:12] == 3'b011) return 5'd8;   // vmv<nr>r.v
+      return 5'((2 * g > 8) ? 8 : 2 * g);
+    end
+    if (i[6:0] == 7'b0000111 && (i[14:12] == 3'b000 || i[14:12] == 3'b101 || i[14:12] == 3'b110 || i[14:12] == 3'b111)) begin
+      int ew, nf;
+      ew = (i[14:12] == 3'b000) ? 0 : int'(i[13:12]);                  // EEW log2 (8 / 16 / 32 / 64 -> 0..3)
+      nf = int'(i[31:29]) + 1;
+      if (i[27:26] == 2'b00 && i[24:20] == 5'b01000) return 5'(nf);    // 整寄存器
+      if (i[27:26] == 2'b00 && i[24:20] == 5'b01011) return 5'd1;      // 掩码
+      eg = ew - int'(sew) + (lmul[2] ? int'(lmul) - 8 : int'(lmul));   // EMUL log2
+      n  = ((eg > 0) ? (1 << eg) : 1) * nf;
+      // 索引方式：目的按数据 EEW = SEW，组大小 = LMUL
+      if (i[27:26] == 2'b01 || i[27:26] == 2'b11) n = g * nf;
+      return 5'((n > 8) ? 8 : n);
+    end
+    return 5'd0;
+  endfunction
 
   // a 是否比 b 老 (a 在程序序上先于 b)
   function automatic logic rob_older(input rob_ptr_t a, input rob_ptr_t b);
@@ -705,8 +954,11 @@ package o6_pkg;
       c.ld[s]  = v[s] && u[s].fu == FU_LD;
       c.fxb[s] = v[s] && fixed_b(u[s]);
       c.sto[s] = v[s] && (u[s].fu == FU_ST || u[s].fu == FU_AMO);
-      c.dq[s]  = v[s] && ((u[s].fu == FU_ST && u[s].rs2_class != RC_FP) || (u[s].fu == FU_AMO && !amo_nodata(u[s].op)));
-      c.f1[s]  = v[s] && u[s].fu == FU_ST && u[s].rs2_class == RC_FP;
+      // M3b：向量 store 数据 uop 的数据半边进 VIQ，不进 IQ_D / IQ_F
+      // V1.2c：带标量源的乱序向量候选 (vxs) 也派一个数据半边读 x / f[rs1]
+      c.dq[s]  = v[s] && ((u[s].fu == FU_ST && !u[s].vms && u[s].rs2_class != RC_FP) || (u[s].fu == FU_AMO && !amo_nodata(u[s].op)) ||
+                          (u[s].vxs && u[s].rs2_class == RC_INT));
+      c.f1[s]  = v[s] && ((u[s].fu == FU_ST && !u[s].vms && u[s].rs2_class == RC_FP) || (u[s].vxs && u[s].rs2_class == RC_FP));
       c.f0[s]  = v[s] && (u[s].fu == FU_FMA || u[s].fu == FU_FMISC || u[s].fu == FU_F2I || u[s].fu == FU_FDIV);
       c.fq[s]  = c.f0[s] || c.f1[s];
     end
@@ -1031,9 +1283,10 @@ package o6_pkg;
           else                         begin r.mq[s] = 1'b1; nn++; end
         end
         if (u[s].fu == FU_ST || u[s].fu == FU_AMO) nsa++;
-        if ((u[s].fu == FU_ST && u[s].rs2_class != RC_FP) || (u[s].fu == FU_AMO && !amo_nodata(u[s].op))) nd++;   // LR 与 cbo.* 无数据 (同 gn_cls / o6_dispatch)
+        if ((u[s].fu == FU_ST && !u[s].vms && u[s].rs2_class != RC_FP) || (u[s].fu == FU_AMO && !amo_nodata(u[s].op)) ||
+            (u[s].vxs && u[s].rs2_class == RC_INT)) nd++;   // LR 与 cbo.* 无数据 (同 gn_cls / o6_dispatch)；M3b 向量 store 数据进 VIQ
         if (u[s].fu == FU_FMA || u[s].fu == FU_FMISC || u[s].fu == FU_F2I || u[s].fu == FU_FDIV ||
-            (u[s].fu == FU_ST && u[s].rs2_class == RC_FP)) nf++;
+            (u[s].fu == FU_ST && !u[s].vms && u[s].rs2_class == RC_FP) || (u[s].vxs && u[s].rs2_class == RC_FP)) nf++;
         if (u[s].fu == FU_LD) nl++;
         if (u[s].fu == FU_ST || u[s].fu == FU_AMO) ns++;
       end
@@ -1055,7 +1308,7 @@ package o6_pkg;
           FU_LD:                          begin h0 = 1'b1; q0 = r.mq[s] ? 3'(IQ_N) : 3'(IQ_M); end
           FU_ST: begin
             h0 = 1'b1; q0 = 3'(IQ_S);
-            h1 = 1'b1; q1 = (u[s].rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D);
+            h1 = !u[s].vms; q1 = (u[s].rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D);
           end
           FU_AMO: begin
             h0 = 1'b1; q0 = 3'(IQ_S);
@@ -1064,6 +1317,8 @@ package o6_pkg;
           FU_FMA, FU_FMISC, FU_F2I, FU_FDIV: begin h0 = 1'b1; q0 = 3'(IQ_F); end
           default: ;
         endcase
+        // V1.2c：带标量源的乱序向量候选 (fu = FU_NONE) 只有数据半边
+        if (u[s].vxs) begin h1 = 1'b1; q1 = (u[s].rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D); end
       end
       if (h0) begin
         if (cnt[q0] < IQ_ENQ_MAX) r.sel[q0][cnt[q0]][s] = 1'b1;
@@ -1229,6 +1484,38 @@ package o6_pkg;
     for (int l = 0; l < L1_WB; l++) begin
       r[n] = ~w[L1_WB-1-l];
       n = 2*n + 1 + int'(w[L1_WB-1-l]);
+    end
+    return r;
+  endfunction
+
+  //==========================================================================
+  // M1 D$ 几何：32 组 x 32 路 x 128 B = 128 KB。VIPT 无别名要求每路 <= 4 KB (组号 = 虚地址 [11:7])，
+  //   128 KB 就要 32 路 (I$ 仍用上面的 L1_NWAY = 16、64 B 行)
+  //==========================================================================
+`ifdef O6_DC_NWAY
+  localparam int DC_NWAY = `O6_DC_NWAY;
+`else
+  localparam int DC_NWAY = 32;
+`endif
+  localparam int DC_WB   = $clog2(DC_NWAY);
+  function automatic logic [DC_WB-1:0] dc_plru_victim(input logic [DC_NWAY-2:0] t);
+    logic [DC_WB-1:0] v;
+    int n;
+    n = 0;
+    for (int l = 0; l < DC_WB; l++) begin
+      v[DC_WB-1-l] = t[n];
+      n = 2*n + 1 + int'(t[n]);
+    end
+    return v;
+  endfunction
+  function automatic logic [DC_NWAY-2:0] dc_plru_touch(input logic [DC_NWAY-2:0] t, input logic [DC_WB-1:0] w);
+    logic [DC_NWAY-2:0] r;
+    int n;
+    r = t;
+    n = 0;
+    for (int l = 0; l < DC_WB; l++) begin
+      r[n] = ~w[DC_WB-1-l];
+      n = 2*n + 1 + int'(w[DC_WB-1-l]);
     end
     return r;
   endfunction

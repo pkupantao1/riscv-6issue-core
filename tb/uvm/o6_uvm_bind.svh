@@ -9,7 +9,7 @@
   assign u_vif.tb_done  = tb_done;
   assign u_vif.tb_pass  = tb_pass;
   assign u_vif.tb_err   = n_err;
-  assign u_vif.n_commit = n_commit;
+  assign u_vif.n_commit = n_icmt;   // M3：按指令计
   assign u_vif.cyc      = cyc;
 `ifdef TB_SOC
   assign u_vif.irq_pend = soc_eirq;
@@ -28,7 +28,7 @@
   // 提交口：与 tb_top 的对拍取同样的量
   always_comb
     for (int c = 0; c < W; c++) begin
-      u_vif.cm_v[c]    = `CORE.u_rob.cm_valid_o[c];
+      u_vif.cm_v[c]    = `CORE.u_rob.cm_valid_o[c] && !`CORE.u_rob.cm_vmid_o[c];   // M3：展开的指令只在最后一个 uop 提交时算一条
       u_vif.cm_pc[c]   = `CORE.`FE.ftq_pc[`CORE.u_rob.hent[c].ftq_idx] + {`CORE.u_rob.hent[c].ftq_off, 1'b0};
       u_vif.cm_insn[c] = `CORE.u_rob.dbg_raw[`CORE.u_rob.head_row][c];
       u_vif.cm_rdt[c]  = !`CORE.u_rob.cm_rd_valid_o[c] ? 2'd0 : (`CORE.u_rob.cm_rd_fp_o[c] ? 2'd2 : 2'd1);
@@ -118,7 +118,7 @@
     u_vif.ev[EV_PTW_BUSY] = `CORE.ptw_busy;
     u_vif.ev[EV_DPF]      = `CORE.u_lsu.dpf_v;
     u_vif.ev[EV_MMIO]     = `CORE.u_lsu.mmio_req_o && `CORE.u_lsu.mmio_ack_i;
-    u_vif.ev[EV_VU_BUSY]  = !`CORE.u_vu.idle_o;
+    u_vif.ev[EV_VECU_BUSY]  = !`CORE.u_vecu.idle_o;
     u_vif.ev[EV_CMT_FULL] = (`CORE.cm_valid == '1);
     u_vif.ev[EV_SQ_FULL]  = (`CORE.u_lsu.sqv == '1);
     u_vif.ev[EV_LQ_FULL]  = (`CORE.u_lsu.lqv == '1);

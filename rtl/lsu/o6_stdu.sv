@@ -26,7 +26,8 @@ module o6_stdu
   output logic [N_STDP-1:0]   std_valid_o,
   output sq_ptr_t [N_STDP-1:0] std_sq_o,
   output rob_ptr_t [N_STDP-1:0] std_rob_o,
-  output logic [63:0]         std_data_o [N_STDP]
+  output logic [63:0]         std_data_o [N_STDP],
+  output logic [N_STDP-1:0]   std_vx_o          // V1.2c：带标量源的乱序向量运算的数据半边 (送 VIQ，不写 SQ)
 );
   function automatic logic [63:0] byp(input preg_t p, input logic [63:0] v, input wb_t [N_IWB-1:0] wb);
     logic [63:0] r;
@@ -77,6 +78,7 @@ module o6_stdu
       std_valid_o[p] = ex_v[p] && !br_killed(ex_u[p].br_mask, br_upd_i);
       std_sq_o[p]    = ex_u[p].sq_idx;
       std_rob_o[p]   = ex_u[p].rob_idx;
+    std_vx_o[p]    = ex_u[p].vxs;
       std_data_o[p]  = (ex_u[p].rs2_class == RC_NONE) ? 64'd0 : byp(ex_u[p].psrc2, ex_d0[p], wb_i);
     end
   end

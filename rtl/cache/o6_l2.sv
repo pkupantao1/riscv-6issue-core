@@ -1,5 +1,5 @@
 //==============================================================================
-// o6_l2.sv - L2 缓存：1 MB / 8 路 / 2048 组 / 64 B 行 / 写回 + 写分配 / 与 L1 非包含 / 非阻塞
+// o6_l2.sv - L2 缓存：1 MB / 8 路 / 1024 组 / 128 B 行 (M1，原 2048 组 / 64 B) / 写回 + 写分配 / 与 L1 非包含 / 非阻塞
 //
 // 上游：核的行请求口 (读 = 取行，写 = L1 写回整行)；下游：同格式的行请求口 (接 o6_line2axi)。
 //
@@ -19,7 +19,7 @@
 //
 // 存储：
 //   标签 + 元数据：一块 NSET x MW 单口 SRAM (每路 {有效, 脏, TW 位标签} x 8 + 7 位 PLRU + 1 位保留)
-//   数据：每路一块 NSET x 512 单口 SRAM (ASIC 上由 sp299 宏拼成，见 docs/05_sram_macros.md)
+//   数据：每路一块 NSET x 1024 单口 SRAM (ASIC 上由 sp299 宏拼成，见 docs/05_sram_macros.md)
 // SRAM 读延迟 RD_LAT 拍 (FPGA 1；ASIC 40LP 下 sp299 宏要 2 拍，对应多周期约束)。
 //
 // 防死锁：响应 FIFO 满时只拒收读请求，写回请求照收 (上游 D$ 在有待发写回时不收响应，必须先让写回进来)。
@@ -38,34 +38,34 @@ module o6_l2
   input  wire                 up_req_valid_i,
   output logic                up_req_ready_o,
   input  wire                 up_req_we_i,
-  input  wire  [PA_W-1:6]     up_req_addr_i,
-  input  wire  [511:0]        up_req_data_i,
+  input  wire  [PA_W-1:CL_O]     up_req_addr_i,
+  input  wire  [CL_W-1:0]        up_req_data_i,
   input  wire  [3:0]          up_req_id_i,
   output logic                up_resp_valid_o,
   input  wire                 up_resp_ready_i,
   output logic [3:0]          up_resp_id_o,
-  output logic [511:0]        up_resp_data_o,
+  output logic [CL_W-1:0]        up_resp_data_o,
 
   // 下游
   output logic                dn_req_valid_o,
   input  wire                 dn_req_ready_i,
   output logic                dn_req_we_o,
-  output logic [PA_W-1:6]     dn_req_addr_o,
-  output logic [511:0]        dn_req_data_o,
+  output logic [PA_W-1:CL_O]     dn_req_addr_o,
+  output logic [CL_W-1:0]        dn_req_data_o,
   output logic [3:0]          dn_req_id_o,
   input  wire                 dn_resp_valid_i,
   output logic                dn_resp_ready_o,
   input  wire  [3:0]          dn_resp_id_i,
-  input  wire  [511:0]        dn_resp_data_i,
+  input  wire  [CL_W-1:0]        dn_resp_data_i,
   // MBIST (各 SRAM 的 March C− 引擎；done 全与、fail 全或)
   input  wire                 bist_start_i,
   output logic                bist_done_o,
   output logic                bist_fail_o
 );
-  localparam int NSET = 2048;
+  localparam int NSET = (1 << 20) / (8 * CL_B);   // M1：1 MB / 8 路 / 128 B 行 = 1024 组
   localparam int NWAY = 8;
-  localparam int SW   = $clog2(NSET);  // 组号宽度 (11)
-  localparam int TW   = PA_W - 6 - SW; // 标签宽度 (23)
+  localparam int SW   = $clog2(NSET);  // 组号宽度 (10)
+  localparam int TW   = PA_W - CL_O - SW; // 标签宽度 (23)
   localparam int EW   = TW + 2;        // 每路元数据
   localparam int MW   = NWAY * EW + 8; // 208
   localparam int MIW  = $clog2(NM);
@@ -85,12 +85,12 @@ module o6_l2
 
   logic [NWAY-1:0] d_ce, d_we;
   logic [SW-1:0]   d_addr;
-  logic [511:0]    d_wdata;
-  logic [511:0]    d_rdata [NWAY];
+  logic [CL_W-1:0]    d_wdata;
+  logic [CL_W-1:0]    d_rdata [NWAY];
   logic [NWAY-1:0] dd, df;
   for (genvar w = 0; w < NWAY; w++) begin : g_way
-    o6_sram_sp #(.DEPTH(NSET), .WIDTH(512), .STYLE("ultra")) u_data (
-      .clk_i, .ce_i(d_ce[w]), .we_i(d_we[w]), .addr_i(d_addr), .wdata_i(d_wdata), .wmask_i({512{1'b1}}),
+    o6_sram_sp #(.DEPTH(NSET), .WIDTH(CL_W), .STYLE("ultra")) u_data (
+      .clk_i, .ce_i(d_ce[w]), .we_i(d_we[w]), .addr_i(d_addr), .wdata_i(d_wdata), .wmask_i({CL_W{1'b1}}),
       .rdata_o(d_rdata[w]),
       .bist_start_i, .bist_done_o(dd[w]), .bist_fail_o(df[w])
     );
@@ -126,15 +126,15 @@ module o6_l2
   //--------------------------------------------------------------------------
   typedef enum logic [1:0] {M_FREE, M_REQ, M_WAIT, M_FILL} mst_e;
   mst_e            ms_st  [NM];
-  logic [PA_W-1:6] ms_line[NM];
+  logic [PA_W-1:CL_O] ms_line[NM];
   logic [3:0]      ms_id  [NM];       // 上游请求号
-  logic [511:0]    ms_data[NM];
+  logic [CL_W-1:0]    ms_data[NM];
   logic [NM-1:0]   ms_ovr;            // 上游写回已覆盖数据 (下游数据作废；回填为脏)
 
   // 写回缓冲 (1 项：牺牲的脏行)
   logic            wb_v;
-  logic [PA_W-1:6] wb_line;
-  logic [511:0]    wb_data;
+  logic [PA_W-1:CL_O] wb_line;
+  logic [CL_W-1:0]    wb_data;
 
   // 上游请求与 MSHR 的行比较
   logic [NM-1:0] up_hit_m;
@@ -154,12 +154,12 @@ module o6_l2
   // 响应 FIFO
   //--------------------------------------------------------------------------
   logic [3:0]   fq_id   [FQD];
-  logic [511:0] fq_data [FQD];
+  logic [CL_W-1:0] fq_data [FQD];
   logic [$clog2(FQD)-1:0] fq_h, fq_t;
   logic [$clog2(FQD):0]   fq_n;
   logic         fq_push;
   logic [3:0]   fq_push_id;
-  logic [511:0] fq_push_data;
+  logic [CL_W-1:0] fq_push_data;
   wire          fq_pop  = up_resp_valid_o && up_resp_ready_i;
   wire          fq_room = (fq_n < FQD);
   assign up_resp_valid_o = (fq_n != 0);
@@ -176,8 +176,8 @@ module o6_l2
   logic [1:0]      wcnt;          // SRAM 读等待计数
   logic [SW-1:0]   init_set;      // 复位后逐组清元数据 (SRAM 上电内容随机)
   logic            q_we;
-  logic [PA_W-1:6] q_addr;
-  logic [511:0]    q_data;        // 写请求数据 / 读命中数据 / 回填数据
+  logic [PA_W-1:CL_O] q_addr;
+  logic [CL_W-1:0]    q_data;        // 写请求数据 / 读命中数据 / 回填数据
   logic [3:0]      q_id;
   logic            q_dirty;       // 写入后的脏位 (写 = 1；回填 = MSHR 被覆盖过)
   logic [MIW-1:0]  q_m;           // 回填任务的 MSHR 号
@@ -185,8 +185,8 @@ module o6_l2
   logic [2:0]      way;           // 命中路或牺牲路
   logic            hit;
 
-  wire [SW-1:0]  set = q_addr[SW+5:6];
-  wire [TW-1:0]  tg  = q_addr[PA_W-1:SW+6];
+  wire [SW-1:0]  set = q_addr[SW+CL_O-1:CL_O];
+  wire [TW-1:0]  tg  = q_addr[PA_W-1:SW+CL_O];
 
   // 回填任务：有 MSHR 数据到齐、响应 FIFO 有空、写回缓冲空 (牺牲行可能要写回)
   logic          fill_v;
@@ -236,8 +236,8 @@ module o6_l2
         m_ce = 1'b1; m_we = 1'b1; m_addr = init_set; m_wdata = '0;
       end
       S_IDLE: begin
-        if (fill_go) begin m_ce = 1'b1; m_addr = ms_line[fill_m][SW+5:6]; end
-        else if (up_take && !up_absorb) begin m_ce = 1'b1; m_addr = up_req_addr_i[SW+5:6]; end
+        if (fill_go) begin m_ce = 1'b1; m_addr = ms_line[fill_m][SW+CL_O-1:CL_O]; end
+        else if (up_take && !up_absorb) begin m_ce = 1'b1; m_addr = up_req_addr_i[SW+CL_O-1:CL_O]; end
       end
       S_DONE, S_FDONE: begin
         // 写数据 (写 / 回填；读命中不写) + 写元数据 + 读命中 / 回填推响应

@@ -69,7 +69,8 @@ module o6_fpu_exu
   output logic                std_valid_o,
   output sq_ptr_t             std_sq_o,
   output rob_ptr_t            std_rob_o,
-  output logic [63:0]         std_data_o
+  output logic [63:0]         std_data_o,
+  output logic                std_vx_o           // V1.2c：带标量源的乱序向量运算的数据半边 (送 VIQ，不写 SQ)
 );
   localparam int NSLOT = 16;      // >= 每实例最多在飞运算数 (5 级 fpnew + RF/EX + 输出寄存)
   localparam int SW    = 4;
@@ -656,6 +657,7 @@ module o6_fpu_exu
   assign std_valid_o = p7_std;
   assign std_sq_o    = ex_u[1].sq_idx;
   assign std_rob_o   = ex_u[1].rob_idx;
+  assign std_vx_o    = ex_u[1].vxs;
   // FSW 只存低 32 位 (SQ 按 size 截取)；不检查 NaN-boxing (RISC-V 规定原样存)
   assign std_data_o  = ex_op[1][1];
 

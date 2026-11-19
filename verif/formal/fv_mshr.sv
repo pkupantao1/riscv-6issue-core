@@ -16,6 +16,7 @@ module fv_mshr
   input  wire  [PA_W-1:0]     ld_addr  [NLD],
   input  wire  [PA_W-1:0]     ld_paddr [NLD],
   input  wire  [NLD-1:0]      ld_kill,
+  input  wire  [NLD-1:0]      ld_wide,            // M2：整行读 (自由输入)
   input  wire                 st_req,
   input  wire  [PA_W-1:0]     st_paddr, st_next_paddr, st_lk_paddr,
   input  wire  [63:0]         st_data,
@@ -24,15 +25,15 @@ module fv_mshr
   input  wire  [4:0]          st_amo_op,
   input  wire  [1:0]          st_size,
   input  wire                 st_line,
-  input  wire  [511:0]        st_ldata,
-  input  wire  [63:0]         st_lmask,
+  input  wire  [CL_W-1:0]     st_ldata,
+  input  wire  [CL_B-1:0]     st_lmask,
   input  wire                 pf_req,
   input  wire  [PA_W-1:0]     pf_paddr,
   input  wire                 flush_req,
   input  wire                 mem_req_ready,
   input  wire                 mem_resp_valid,
   input  wire  [3:0]          mem_resp_id,
-  input  wire  [511:0]        mem_resp_data
+  input  wire  [CL_W-1:0]     mem_resp_data
 );
   logic [NLD-1:0] ld_hit, ld_nack;
   logic [63:0]    ld_data [NLD];
@@ -40,13 +41,14 @@ module fv_mshr
   logic refill, st_done, flush_done, mem_req_valid, mem_req_we, mem_resp_ready, bist_done, bist_fail;
   logic [MSHR_W-1:0] refill_mshr;
   logic [63:0]  st_rdata;
-  logic [511:0] st_lrdata, mem_req_data;
-  logic [PA_W-1:6] mem_req_addr;
+  logic [CL_W-1:0] st_lrdata;
+  logic [CL_W-1:0] mem_req_data;
+  logic [PA_W-1:CL_O] mem_req_addr;
   logic [3:0]   mem_req_id;
 
   o6_dcache #(.NMSHR(NMSHR), .NLD(NLD)) dut (
     .clk_i(clk), .rst_ni(rst_n),
-    .ld_req_i(ld_req), .ld_addr_i(ld_addr), .ld_paddr_i(ld_paddr), .ld_kill_i(ld_kill),
+    .ld_req_i(ld_req), .ld_addr_i(ld_addr), .ld_wide_i(ld_wide), .ld_line_o(), .ld_paddr_i(ld_paddr), .ld_kill_i(ld_kill),
     .ld_hit_o(ld_hit), .ld_nack_o(ld_nack), .ld_data_o(ld_data), .ld_mshr_o(ld_mshr),
     .refill_o(refill), .refill_mshr_o(refill_mshr),
     .st_req_i(st_req), .st_paddr_i(st_paddr), .st_next_paddr_i(st_next_paddr), .st_lk_paddr_i(st_lk_paddr),
@@ -81,7 +83,7 @@ module fv_mshr
   // 可达性
   for (genvar k = 0; k < NLD; k++) begin : g_cov
     cov_st_ld_same: cover property (@(posedge clk) disable iff (!rst_n)
-      dut.st_miss_alloc && dut.l1_v[k] && dut.l1_go[k] && !ld_kill[k] && ld_paddr[k][PA_W-1:6] == dut.spa_q[PA_W-1:6]);
+      dut.st_miss_alloc && dut.l1_v[k] && dut.l1_go[k] && !ld_kill[k] && ld_paddr[k][PA_W-1:CL_O] == dut.spa_q[PA_W-1:CL_O]);
   end
   cov_two:  cover property (@(posedge clk) disable iff (!rst_n) dut.m_st[0] != M_FREE && dut.m_st[1] != M_FREE);
   cov_pf:   cover property (@(posedge clk) disable iff (!rst_n) dut.pf_alloc);

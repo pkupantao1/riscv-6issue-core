@@ -101,11 +101,13 @@ module o6_lsu
   // D$ load 口 (k = 0..N_LDP-1)：L0 请求，L1 给物理地址/取消，L2 返回
   output logic [N_LDP-1:0]    dc_ld_req_o,
   output logic [PA_W-1:0]     dc_ld_addr_o [N_LDP],    // L0：虚拟地址 (索引)；裸机 = 物理地址
+  output logic [N_LDP-1:0]    dc_ld_wide_o,            // L0：整行读 (M2：同拍多条 load 读同一行时共用一次 1024 位读)
   output logic [PA_W-1:0]     dc_ld_paddr_o [N_LDP],   // L1
   output logic [N_LDP-1:0]    dc_ld_kill_o,            // L1
   input  wire  [N_LDP-1:0]    dc_ld_hit_i,             // L2
   input  wire  [N_LDP-1:0]    dc_ld_nack_i,            // L2：bank 冲突 / MSHR 满，稍后重放
   input  wire  [63:0]         dc_ld_data_i [N_LDP],    // L2：8 字节对齐的双字
+  input  wire  [CL_W-1:0]     dc_ld_line_i [N_LDP],    // L2：整行读的那一行 (M2；M3 的向量 load uop 用)
   input  wire  [MSHR_W-1:0]   dc_ld_mshr_i [N_LDP],    // L2：缺失时分配的 MSHR 号
   input  wire                 dc_refill_i,         // 某个 MSHR 回填完成
   input  wire  [MSHR_W-1:0]   dc_refill_mshr_i,
@@ -122,10 +124,21 @@ module o6_lsu
   output logic [1:0]          dc_st_size_o,
   input  wire                 dc_st_done_i,        // 本请求完成 (可与 req 同拍)
   input  wire  [63:0]         dc_st_rdata_i,       // AMO 旧值 (双字对齐)
-  output logic                dc_st_line_o,        // 整行模式 (向量访存)
-  output logic [511:0]        dc_st_ldata_o,
-  output logic [63:0]         dc_st_lmask_o,
-  input  wire  [511:0]        dc_st_lrdata_i,
+  output logic                dc_st_line_o,        // 整行模式 (M2：128 B，store 合并 / Zicbom / Zicboz)
+  output logic [CL_W-1:0]     dc_st_ldata_o,
+  output logic [CL_B-1:0]     dc_st_lmask_o,
+  input  wire  [CL_W-1:0]     dc_st_lrdata_i,
+  // D$ 向量行口 (P2.1 / P3)：A 级请求 (连续 VM_NL 行，dc_v_ln 选访问哪几行) 保持到 ack；读数据在 ack 下一拍
+  output logic                dc_v_req_o,
+  output logic [PA_W-1:0]     dc_v_paddr_o,
+  output logic [VM_NL-1:0]    dc_v_ln_o,
+  output logic [PA_W-1:0]     dc_v_next_paddr_o,
+  output logic                dc_v_we_o,
+  output logic [511:0]        dc_v_wdata_o [VM_NL],
+  output logic [63:0]         dc_v_wmask_o [VM_NL],
+  input  wire                 dc_v_ack_i,
+  input  wire                 dc_v_rv_i,
+  input  wire  [511:0]        dc_v_rdata_i [VM_NL],
 
   // MMIO 口
   output logic                mmio_req_o,
@@ -144,14 +157,57 @@ module o6_lsu
   input  wire                 vm_req_i,
   output logic                vm_ack_o,
   input  wire                 vm_we_i,
-  input  wire  [63:0]         vm_va_i,             // 本次第一个活动字节的虚地址 (行 = [63:6])
-  input  wire  [511:0]        vm_wdata_i,          // 整行 (按行内字节位置)
-  input  wire  [63:0]         vm_wmask_i,
+  input  wire                 vm_cont_i,           // 突发的后续行 (P2.3)：紧接上一行、同一页，不再查 DTLB (物理地址 = 上一行 + 64)
+  input  wire  [63:0]         vm_va_i,             // 本次第 0 行的地址 (行 = [63:6]；有活动字节时是第一个活动字节)
+  // P3：一次最多连续 VM_NL 行 (同一页)，vm_ln 选访问哪几行；突发的"上一行" = 上一次里编号最大的访问行
+  input  wire  [VM_NL-1:0]    vm_ln_i,
+  input  wire  [511:0]        vm_wdata_i [VM_NL],  // 各行 (按行内字节位置)
+  input  wire  [63:0]         vm_wmask_i [VM_NL],
   output logic                vm_done_o,           // 单拍
-  output logic [511:0]        vm_rdata_o,
-  output logic                vm_fault_o,          // 页错误 / 访问错误 (不访存)
+  output logic [511:0]        vm_rdata_o [VM_NL],
+  output logic                vm_fault_o,          // 页错误 / 访问错误：vm_flane 那行及之后的行不访存，之前的行已访存 (读数据有效)
+  output logic [1:0]          vm_flane_o,
   output logic [5:0]          vm_cause_o,
+  output logic                vm_conf_o,           // 本拍写的向量 store 行与更年轻的 load 可能冲突 (P2.4a：VECU 据此决定提交后冲刷)
+  output logic                vm_tce_o,            // T / C 级都空：收下的行都已过翻译与 PMA / PMP 检查，不会再报错 (P2.4b)
+  // I2a (docs/11 §9e)：提交后异步执行的向量 load。vm_async：VECU 当前这条是它 (访问 D$ 不等 SQ 全空，只等比它老的 store
+  //   排空：sq_head == vm_sqb，vm_sqb = 它分派时的 SQ 尾)。vbar：最老的未完成异步向量 load 的 SQ 界，SQ 头到界时
+  //   (头是比它年轻的 store / AMO) 不排空，免得它读到更年轻的写
+  input  wire                 vm_async_i,
+  input  var sq_ptr_t         vm_sqb_i,
+  input  wire                 vbar_v_i,
+  input  var sq_ptr_t         vbar_i,
+  // I2a VPC：P3 的 EX 级送来的预查 (单位步长类向量 load 的 [基址, 基址 + VEL_SPAN))，三拍后经完成口完成 (不通过则 replay)
+  input  wire                 vpc_v_i,
+  input  wire  [63:0]         vpc_va_i,
+  input  var rob_ptr_t        vpc_rob_i,
+  input  var br_mask_t        vpc_bm_i,
+  input  wire  [1:0]          vpc_eb_i,
+  input  wire                 vpc_we_i,            // M3b：向量 store 的检查 uop (按写权限查)
+  output cmpl_t               vpc_cmpl_o,
   input  wire                 lr_clear_i,          // 陷入时清 LR 保留
+  // M3 (docs/11 §9g)：向量 load 数据 uop (uop.vml) 在 load 流水里整行读，结果经 VECU 的 load 写口写向量物理寄存器
+  //   (vlw_bm 的字节写 load 数据，vlw_ov 时其余字节写 vd 旧值 vlw_old；vlw_last = 这条 uop 写完，清忙)。
+  //   vbusy：向量物理寄存器忙 (旧值源还没写好时等)。vml_slow：碰到处理不了的情况 (跨页 / 异常 / MMIO)，
+  //   这条 uop 以 replay 完成，同时要求核对重取后的那条走原路径 (vslow)
+  input  wire  [N_VPREG-1:0]  vbusy_i,
+  output logic [N_LDP-1:0]    vlw_v_o,
+  output preg_t [N_LDP-1:0]   vlw_pd_o,
+  output logic [CL_W-1:0]     vlw_d_o [N_LDP],
+  output logic [CL_B-1:0]     vlw_bm_o [N_LDP],
+  output logic [N_LDP-1:0]    vlw_ov_o,
+  output vsrc_t [N_LDP-1:0]   vlw_old_o,
+  output logic [N_LDP-1:0]    vlw_last_o,
+  output logic [N_LDP-1:0]    vlw_mk_o,            // M4a：带掩码的 load (VECU 按 v0 只写掩码为 1 的字节)
+  output vsrc_t [N_LDP-1:0]   vlw_m0_o,
+  output logic [2:0]          vlw_k_o [N_LDP],
+  output logic [1:0]          vlw_eb_o [N_LDP],
+  output logic                vml_slow_o,          // (M3b：STA 流水里的向量 store 数据 uop 同样可要求走原路径)
+  // M3b：向量 store 数据 uop 的数据 (VECU 的 VX 读出的整寄存器)，写 SQ 项 vsd_sq 的 128 B 数据
+  input  wire                 vsd_v_i,
+  input  var sq_ptr_t         vsd_sq_i,
+  input  wire  [CL_W-1:0]     vsd_d_i,
+  input  wire  [CL_B-1:0]     vsd_bm_i,            // M4a：写哪些字节 (寄存器字节序；不带掩码时全 1)
 
   // MMU：地址转换上下文
   // 翻译上下文 (o6_csr 算好)：普通访存用 dctx (含 MPRV / MPV)，HLV / HSV 用 hctx (H：V = 1、特权级 hstatus.SPVP)
@@ -260,6 +316,17 @@ module o6_lsu
     logic             ld_wait;    // 访存相关预测标记 (重放时恢复到 uop)
     logic [FTQ_W-1:0]     ftq_idx;
     logic [FTQ_OFF_W-1:0] ftq_off;
+    // M3 向量 load 数据 uop：有效字节 vnb、vd 旧值源 vold；窗口 [vpa0, vpa0 + vnb) (第一遍的物理地址)；
+    //   跨行时分两遍，vpass = 1 表示第一遍已写进寄存器、paddr 已改成下一行起点 (经端口 0 重放做第二遍)
+    logic             vml;
+    logic [7:0]       vnb;
+    vsrc_t            vold;
+    logic             vpass;
+    logic [PA_W-1:0]  vpa0;
+    logic             vmk;        // M4a：带掩码 (v0 源 vm0，第 vk 个寄存器，元素宽度 2^veb 字节)
+    vsrc_t            vm0;
+    logic [2:0]       vk;
+    logic [1:0]       veb;
   } lq_ent_t;
 
   typedef struct packed {
@@ -282,11 +349,21 @@ module o6_lsu
     logic [63:0]      data;       // 原始数据 (低位对齐)
     logic             committed;
     logic             amo_done;
+    // M3b 向量 store 数据 uop：窗口 [vpa0, vpa0 + vnb) (STA 写)，数据在 sq_vd (整寄存器，寄存器字节 i -> 地址 vpa0 + i)。
+    //   跨行时分两次排空：第一次写本行后 vpass = 1、paddr 改成下一行起点，第二次写下一行后出队
+    logic             vms;
+    logic [7:0]       vnb;
+    logic [PA_W-1:0]  vpa0;
+    logic             vpass;
+    logic             pf0, pf1;   // M3b 排空预取已发 (pf1：跨行向量 store 的第二行)
+    logic             vraw;       // M3c：向量 store 数据已到 (按寄存器字节序)，还没旋转成按行内偏移放 (data_ok 在旋转后才置)
   } sq_ent_t;
 
   lq_ent_t           lq [NLQ];
   logic [NLQ-1:0]    lqv;
   sq_ent_t           sq [NSQ];
+  logic [CL_W-1:0]   sq_vd [NSQ];     // M3b：SQ 项的 128 B 数据 (向量 store；标量 store 仍用 data 的 64 位)
+  logic [CL_B-1:0]   sq_vbm [NSQ];    // M4a：向量 store 写哪些字节 (带掩码时按 v0；与数据一起旋转成按行内偏移)
   logic [NSQ-1:0]    sqv;
   lq_ptr_t           lq_head, lq_tail;
   sq_ptr_t           sq_head, sq_cmt, sq_tail;
@@ -393,6 +470,8 @@ module o6_lsu
     logic             mmio;
     logic             tlbmiss;    // DTLB 缺失：带重执行标记完成
     logic [63:0]      x2;         // H：guest page fault 的 {隐式 (tinst = 0x3000), 6'b0, GPA[58:2]}，其它异常 0
+    logic             vpass;      // M3：向量 load 的第二遍 (重放)
+    logic [6:0]       voff;       // M3：第一遍的行内偏移 (窗口起点)
   } lp_t;
 
   // 有效位 (带复位) 与载荷 (不带复位) 分开存，避免两个块写同一结构体
@@ -403,24 +482,36 @@ module o6_lsu
   lp_t         l0 [LSU_NP];       // L0 级组合结果：AGU / PMA / 未对齐 已算好
   // 向量单元访存口 (状态机在后面)
   // 向量访存口三级：T (查 DTLB、判缺失 / 页错误)、C (寄存的物理地址判 PMA / PMP)、A (占 D$ 口访问)；
-  // A 有效即占着 D$ store 口 (vm_own)。VU 最多 2 个在途，T/C 一起只做下一行的翻译
+  // A 有效即占着 D$ store 口 (vm_own)。VECU 最多 2 个在途，T/C 一起只做下一行的翻译
   logic            vt_v, vt_we, vt_pw;
   logic            vc_v, vc_we, vc_pf, vc_af;
+  logic            vc_ok_q;        // C 级当前这行已通过检查 (寄存：给预取提示用，P2.1)
+  logic            vt_cont;        // T 级这行是突发的后续行 (P2.3)
+  logic [PA_W-1:0] vl_pa;          // 最近一行离开 T 级的物理地址 (后续行 = 它 + 64)
+  logic            vd_q, vd_we;    // A 级本拍 D$ 收下 -> 下一拍报完成 (读数据那拍)
+  logic            vd_ft;          // 报完成时同时报错 (那次后面的行出错，P3)
+  logic [1:0]      vd_fk;
   logic [63:0]     vc_pa;
-  logic [511:0]    vc_wd;
-  logic [63:0]     vc_wm;
+  logic [VM_NL-1:0] vt_ln, vc_ln, va_ln;
+  logic [511:0]    vc_wd [VM_NL];
+  logic [63:0]     vc_wm [VM_NL];
   logic [63:0]     vt_va;
-  logic [511:0]    vt_wd;
-  logic [63:0]     vt_wm;
+  logic [511:0]    vt_wd [VM_NL];
+  logic [63:0]     vt_wm [VM_NL];
   logic            va_v, va_we;
+  logic            va_ft;          // 这次在 C 级被截短：va_fk 那行起出错 (只有 PMA / PMP 访问错误会按行不同)
+  logic [1:0]      va_fk;
   logic [PA_W-1:0] va_pa;
-  logic [511:0]    va_wd;
-  logic [63:0]     va_wm;
+  logic [511:0]    va_wd [VM_NL];
+  logic [63:0]     va_wm [VM_NL];
   wire             vm_own = va_v;
   logic            vm_tmiss, vm_pf, vm_af, vm_gf;     // T 级的翻译结果 (逻辑见向量访存口一节；gf = guest page fault)
   logic [63:0]     vm_gx, vc_gx;
   logic            vc_gf;
   logic [63:0]     vm_tpa;
+  // I2a VPC 的 T 级 (查 DTLB 的两页：基址页与末字节页)，逻辑见 "向量 load 预查" 一节
+  logic            pv_v;
+  logic [63:0]     pv_va, pv_ve;   // 基址 / 末字节 (基址 + VEL_SPAN - 1)
   logic [LSU_NP-1:0] l2_ld64;     // L2 里是对齐 64 位整数 ld (快速路径的生产者)
   logic [63:0] l2_data [LSU_NP];
 
@@ -488,6 +579,10 @@ module o6_lsu
       rf_in[0].u.ld_wait = e.ld_wait;
       rf_in[0].pa = e.paddr; rf_in[0].mask = e.mask; rf_in[0].mmio = e.mmio;
       rf_in[0].va = {{(64-PA_W){1'b0}}, e.paddr};
+      // M3：向量 load 数据 uop 的重放 (两遍中的第二遍，或缺失 / 等 store / 冲突后重做)
+      rf_in[0].u.vml = e.vml; rf_in[0].u.vnb = e.vnb; rf_in[0].u.vps[2] = e.vold;
+      rf_in[0].u.vmk = e.vmk; rf_in[0].u.vps[3] = e.vm0; rf_in[0].u.vk = e.vk; rf_in[0].u.veb = e.veb;
+      rf_in[0].vpass = e.vpass; rf_in[0].voff = e.vpa0[6:0];
     end
   end
 
@@ -515,18 +610,20 @@ module o6_lsu
   //==========================================================================
   // DTLB：每条流水一个查找口 (L0)
   //==========================================================================
-  logic [VPN_W-1:0] dtlb_vpn [LSU_NP+1];
-  logic [LSU_NP:0]  dtlb_v;                    // H：查找的 V (按 uop 的上下文)       // [LSU_NP]：向量单元的访存口
-  logic [LSU_NP:0]  dtlb_hit;
-  logic [PA_W-13:0] dtlb_ppn [LSU_NP+1];
-  logic [7:0]       dtlb_perm [LSU_NP+1];
-  logic [1:0]       dtlb_fault [LSU_NP+1];
-  logic [3:0]       dtlb_gperm [LSU_NP+1];
-  logic [56:0]      dtlb_gpa   [LSU_NP+1];
-  logic             dtlb_gimp  [LSU_NP+1];
+  // [LSU_NP]：向量单元的访存口；[LSU_NP+1] / [LSU_NP+2]：VPC 预查的两页 (I2a)
+  localparam int NDL = LSU_NP + 3;
+  logic [VPN_W-1:0] dtlb_vpn [NDL];
+  logic [NDL-1:0]   dtlb_v;                    // H：查找的 V (按 uop 的上下文)
+  logic [NDL-1:0]   dtlb_hit;
+  logic [PA_W-13:0] dtlb_ppn [NDL];
+  logic [7:0]       dtlb_perm [NDL];
+  logic [1:0]       dtlb_fault [NDL];
+  logic [3:0]       dtlb_gperm [NDL];
+  logic [56:0]      dtlb_gpa   [NDL];
+  logic             dtlb_gimp  [NDL];
   logic [63:0]      l0_va [LSU_NP];
 
-  o6_tlb #(.N(32), .NL(LSU_NP + 1)) u_dtlb (
+  o6_tlb #(.N(32), .NL(NDL)) u_dtlb (
     .clk_i, .rst_ni, .flush_i(tlb_flush_i),
     .lk_vpn_i(dtlb_vpn), .lk_v_i(dtlb_v), .lk_hit_o(dtlb_hit), .lk_ppn_o(dtlb_ppn), .lk_perm_o(dtlb_perm),
     .lk_fault_o(dtlb_fault), .lk_pbmt_o(), .lk_gperm_o(dtlb_gperm), .lk_gpa_o(dtlb_gpa), .lk_gimp_o(dtlb_gimp),
@@ -586,6 +683,10 @@ module o6_lsu
     end
     dtlb_vpn[LSU_NP] = vt_va[VA_W-1:12];
     dtlb_v[LSU_NP]   = dctx_i.v;
+    dtlb_vpn[LSU_NP+1] = pv_va[VA_W-1:12];
+    dtlb_v[LSU_NP+1]   = dctx_i.v;
+    dtlb_vpn[LSU_NP+2] = pv_ve[VA_W-1:12];
+    dtlb_v[LSU_NP+2]   = dctx_i.v;
   end
 
   always_comb begin
@@ -617,6 +718,8 @@ module o6_lsu
           default: mis = 1'b0;
         endcase
         if (l0r[k].u.fu == FU_AMO && amo_is_cbo(l0r[k].u.op)) mis = 1'b0;
+        if (l0r[k].u.vml || l0r[k].u.vms) mis = 1'b0;   // M3：向量访存的窗口按字节，对齐已由检查 uop (VPC) 按 EEW 查过
+        p.vpass = 1'b0; p.voff = va[6:0];
         // 地址转换 (Sv39 / Sv48 / Sv57；H 两级：一级权限错 -> 页错误，优先于 G-stage 权限错 -> guest page fault)
         pf = 1'b0; af = 1'b0; gf = 1'b0; pm8 = '0; gp = '0;
         pa64 = va;
@@ -744,6 +847,13 @@ module o6_lsu
       dc_ld_req_o[k]  = l0_live[k] && l0r[k].u.fu == FU_LD && !l0r[k].pre;
       dc_ld_addr_o[k] = PA_W'(l0r[k].va[11:0]);
     end
+    // M2 标量 load 编排：本拍另有 load 口读同一行 (页内偏移 [11:7] 相同) 的，这几条都按整行读 (D$ 只读一次 1024 位，
+    //   各口从同一行取自己的双字)；只有自己一条读那一行的按 64 位读一个 bank (不占整个行槽)
+    for (int k = 0; k < N_LDP; k++) begin
+      dc_ld_wide_o[k] = l0r[k].u.vml;          // M3：向量 load 数据 uop 一律整行读
+      for (int j = 0; j < N_LDP; j++)
+        if (j != k && dc_ld_req_o[j] && dc_ld_req_o[k] && l0r[j].va[11:CL_O] == l0r[k].va[11:CL_O]) dc_ld_wide_o[k] = 1'b1;
+    end
   end
 
   // STA 流水 (LSU_KS..)：L0 写 SQ 地址；违例检查在下一拍 (L1) 用寄存的物理地址做
@@ -774,14 +884,43 @@ module o6_lsu
     .pf_v_o(dpf_v), .pf_pa_o(dpf_pa)
   );
 
+  // M3b 排空预取：D$ 的 store 缺失时排空停在那一行等回填 (一次一行)，连续写冷数据时吞吐很低。
+  //   从 SQ 头之后 NSPF 项里 (只看已提交的：一定会排空) 挑最老的、地址已定、可缓存、还没预取过的 store，
+  //   借预取口提前申请 MSHR，后面几行的缺失与头部重叠。跨行的向量 store 两行各预取一次。优先级在 load 步长预取之上、STA 预取之下
+  localparam int NSPF = 8;
+  logic            spf_v, spf_go, spf_2nd;
+  logic [SQ_W-1:0] spf_idx;
+  logic [PA_W-1:0] spf_pa;
+  always_comb begin
+    spf_v = 1'b0; spf_idx = '0; spf_pa = '0; spf_2nd = 1'b0;
+    for (int i = NSPF; i >= 1; i--) begin
+      sq_ptr_t p;
+      sq_ent_t e;
+      logic    x2;
+      p  = sq_inc(sq_head, 4'(i));
+      e  = sq[p.idx];
+      x2 = e.vms && (int'(e.vpa0[CL_O-1:0]) + int'(e.vnb) > CL_B);
+      if (sqv[p.idx] && e.committed && e.addr_ok && !e.mmio && !e.is_amo && (!e.pf0 || (x2 && !e.pf1))) begin
+        spf_v   = 1'b1;
+        spf_idx = p.idx;
+        spf_2nd = e.pf0;
+        spf_pa  = e.pf0 ? {e.vpa0[PA_W-1:CL_O] + 1'b1, CL_O'(0)} : {(e.vms ? e.vpa0[PA_W-1:CL_O] : e.paddr[PA_W-1:CL_O]), CL_O'(0)};
+      end
+    end
+  end
+
   // D$ 只有一个预取口：store 预取 (第一条 STA 流水优先) 先，其次 load 步长预取 (预取只是提示，丢了无妨)
   // store 预取不看本拍分支杀 (2026-10-29，6 GHz：p160u62 in 组 kill_tag -> 优先选择 -> dc_pf_paddr_o −27.1)：预取只是提示
   always_comb begin
     dc_pf_req_o = dpf_v; dc_pf_paddr_o = dpf_pa;
+    spf_go = 1'b0;
+    if (spf_v) begin dc_pf_req_o = 1'b1; dc_pf_paddr_o = spf_pa; spf_go = 1'b1; end
     for (int s = N_STA - 1; s >= 0; s--)
       if (l1_v[KS+s] && !flush_i && !l1[KS+s].excp && !l1[KS+s].tlbmiss && l1[KS+s].u.fu == FU_ST && !l1[KS+s].mmio) begin
-        dc_pf_req_o = 1'b1; dc_pf_paddr_o = l1[KS+s].pa;
+        dc_pf_req_o = 1'b1; dc_pf_paddr_o = l1[KS+s].pa; spf_go = 1'b0;
       end
+    // 向量访存 (P2.1)：C 级已过 PMA / PMP 的行提前申请 MSHR (A 级的缺失 D$ 自己会申请)，后面的行与它的缺失重叠
+    if (vc_v && vc_ok_q) begin dc_pf_req_o = 1'b1; dc_pf_paddr_o = vc_pa[PA_W-1:0]; spf_go = 1'b0; end
   end
   logic [NLQ-1:0] lq_pexcl;       // 在流水里、本拍已确定要等待后重新执行的 load (见 L2 判定之后)
   // 违例检查分两拍 (2026-10-25，6 GHz)：STA 的 L1 只算命中向量并寄存 (vh_q)，L2 再从中挑最老、取 rob / ftq，
@@ -798,6 +937,12 @@ module o6_lsu
   always_comb begin
     for (int s = 0; s < N_STA; s++) begin
       logic [NLQ-1:0] hit;
+      // M3b：向量 store 数据 uop 的窗口 [pa, pa + vnb) 至多跨两行，按行比 (保守)
+      logic               svm, sxr;
+      logic [PA_W-1:CL_O] sln;
+      svm = l1[KS+s].u.vms;
+      sln = l1[KS+s].pa[PA_W-1:CL_O];
+      sxr = int'(l1[KS+s].voff) + int'(l1[KS+s].u.vnb) > CL_B;
       for (int i = 0; i < NLQ; i++) begin
         lq_ptr_t e;
         e = '{flag: lq[i].flag, idx: LQ_W'(i)};
@@ -808,6 +953,24 @@ module o6_lsu
                  (lq[i].st == LS_DONE || (lq[i].st == LS_PIPE && !lq_pexcl[i])) &&
                  !lq_older(e, l1[KS+s].u.lq_idx) &&
                  lq[i].paddr[PA_W-1:3] == l1[KS+s].pa[PA_W-1:3] && |(lq[i].mask & l1[KS+s].mask);
+        if (svm && !lq[i].vml)
+          hit[i] = lqv[i] && lq[i].addr_ok && !lq[i].mmio &&
+                   (lq[i].st == LS_DONE || (lq[i].st == LS_PIPE && !lq_pexcl[i])) &&
+                   !lq_older(e, l1[KS+s].u.lq_idx) &&
+                   (lq[i].paddr[PA_W-1:CL_O] == sln || (sxr && lq[i].paddr[PA_W-1:CL_O] == sln + 1'b1));
+        // M3：向量 load 数据 uop 按窗口 [vpa0, vpa0 + vnb) 所在的行比 (保守)；第一遍已写进寄存器 (vpass) 的不论状态都算
+        if (lq[i].vml) begin
+          logic [PA_W-1:CL_O] l0n, sl;
+          logic               xr, lh;
+          l0n = lq[i].vpa0[PA_W-1:CL_O];
+          sl  = l1[KS+s].pa[PA_W-1:CL_O];
+          xr  = int'(lq[i].vpa0[6:0]) + int'(lq[i].vnb) > CL_B;
+          lh  = sl == l0n || (xr && sl == l0n + 1'b1);
+          if (svm) lh = lh || (sxr && sl + 1'b1 == l0n);     // store 的第二行碰 load 窗口的第一行
+          hit[i] = lqv[i] && lq[i].addr_ok &&
+                   (lq[i].st == LS_DONE || lq[i].vpass || (lq[i].st == LS_PIPE && !lq_pexcl[i])) &&
+                   !lq_older(e, l1[KS+s].u.lq_idx) && lh;
+        end
       end
       vh_c[s] = hit;
     end
@@ -930,24 +1093,81 @@ module o6_lsu
     end
   end
 
-  // 每个字节的转发源：每条 load 流水一个 o6_sq_fwd (搜索逻辑见该文件；单元 TB tb/unit/tb_lsu_fwd.sv)
-  // (只在 load 流水上搜；STA 流水的这些量恒为 0)
+  // M3c (docs/11 §9g)：store -> load 按字节转发，任意宽度 (标量 / 向量 store -> 标量 / 向量 load)。
+  //   向量 store 的数据在 SQ 里按行内偏移放 (旋转器处理后才 data_ok)，窗口 [vpa0, vpa0 + vnb) 至多跨两行：
+  //   第一行 (vpass = 0，还没排空) 写 [off, min(off + nb, 128))，第二行写 [0, off + nb - 128)
+  logic [CL_B-1:0]    sq_vm0 [NSQ], sq_vm1 [NSQ];    // 向量 store 在窗口第一 / 第二行写的字节
+  logic [CL_B-1:0]    sq_slm [NSQ];                  // 标量 store 在它那行写的字节
+  logic [PA_W-1:CL_O] sq_ln  [NSQ];                  // 项的行号 (向量 store：窗口第一行)
+  logic [NSQ-1:0]     sq_vmsv, sq_aokv;
+  always_comb
+    for (int e = 0; e < NSQ; e++) begin
+      logic [2*CL_B-1:0] w;
+      w = ((2*CL_B)'(1) << sq[e].vnb) - 1'b1;
+      w = w << sq[e].vpa0[CL_O-1:0];
+      // M4a：带掩码的向量 store 只算掩码为 1 的字节 (sq_vbm 旋转后与行内偏移对齐；旋转前 data_ok = 0，这些字节要等)
+      sq_vm0[e]  = (sq[e].vpass ? '0 : w[CL_B-1:0]) & (sq[e].data_ok ? sq_vbm[e] : '1);
+      sq_vm1[e]  = w[2*CL_B-1:CL_B] & (sq[e].data_ok ? sq_vbm[e] : '1);
+      sq_slm[e]  = CL_B'(sq[e].mask) << {sq[e].paddr[CL_O-1:3], 3'b000};
+      sq_ln[e]   = sq[e].vms ? sq[e].vpa0[PA_W-1:CL_O] : sq[e].paddr[PA_W-1:CL_O];
+      sq_vmsv[e] = sq[e].vms;
+      sq_aokv[e] = sq[e].addr_ok;
+    end
+
+  // 标量 load：每条 load 流水一个 o6_sq_fwd (8 B，搜索逻辑见该文件；单元 TB tb/unit/tb_lsu_fwd.sv)。
+  //   向量 store 那项按本 load 的双字取：地址给成 load 自己的 (同一双字)，掩码 = 它在这个双字里写的字节，数据 = 该双字
   logic [7:0]       fw_hit   [LSU_NP];     // 该字节有 store 覆盖
   logic [63:0]      fw_data  [LSU_NP];
   logic             fw_wait  [LSU_NP];
   logic [SQ_W-1:0]  fw_wsq   [LSU_NP];     // 要等的 store 之一
-  logic [NSQ-1:0]   sq_aokv;
-  logic [PA_W-1:0]  sq_pav   [NSQ];
-  logic [7:0]       sq_maskv [NSQ];
+  logic [PA_W-1:0]  fpa [N_LDP][NSQ];
+  logic [7:0]       fmk [N_LDP][NSQ];
+  logic [63:0]      fsd [N_LDP][NSQ];
+  // 向量 load：每条 load 流水一个 o6_sq_lfwd (整行 128 B)；lf_lm = 各项在本遍那行写的字节，lf_need = 本遍要的字节
+  logic [CL_B-1:0]  lf_lm   [N_LDP][NSQ];
+  logic [CL_B-1:0]  lf_need [N_LDP];
+  logic [CL_B-1:0]  lf_hit  [N_LDP];
+  logic [CL_W-1:0]  lf_data [N_LDP];
+  logic             lf_wait [N_LDP];
+  logic [SQ_W-1:0]  lf_wsq  [N_LDP];
   always_comb
-    for (int e = 0; e < NSQ; e++) begin sq_aokv[e] = sq[e].addr_ok; sq_pav[e] = sq[e].paddr; sq_maskv[e] = sq[e].mask; end
+    for (int k = 0; k < N_LDP; k++) begin
+      logic [PA_W-1:CL_O] ln;
+      logic [3:0]         dw;
+      logic [2*CL_B-1:0]  w;
+      ln = l1[k].pa[PA_W-1:CL_O];
+      dw = l1[k].pa[CL_O-1:3];
+      for (int e = 0; e < NSQ; e++) begin
+        logic [CL_B-1:0] lm;
+        if (sq_vmsv[e]) lm = (sq_ln[e] == ln) ? sq_vm0[e] : (sq_ln[e] + 1'b1 == ln) ? sq_vm1[e] : '0;
+        else            lm = (sq_ln[e] == ln) ? sq_slm[e] : '0;
+        lf_lm[k][e] = lm;
+        if (sq_vmsv[e]) begin
+          fpa[k][e] = l1[k].pa;
+          fmk[k][e] = lm[8*dw +: 8];
+          fsd[k][e] = sq_vd[e][64*dw +: 64];
+        end else begin
+          fpa[k][e] = sq[e].paddr;
+          fmk[k][e] = sq[e].mask;
+          fsd[k][e] = sq_sdata[e];
+        end
+      end
+      w = ((2*CL_B)'(1) << l1[k].u.vnb) - 1'b1;
+      w = w << l1[k].voff;
+      lf_need[k] = !l1[k].u.vml ? '0 : l1[k].vpass ? w[2*CL_B-1:CL_B] : w[CL_B-1:0];
+    end
   for (genvar k = 0; k < LSU_NP; k++) begin : g_fwd
     if (k < N_LDP) begin : g_ld
       o6_sq_fwd #(.NSQ(NSQ)) u_fwd (
-        .sqv_i(sqv), .flag_i(sq_flagv), .addr_ok_i(sq_aokv), .paddr_i(sq_pav), .mask_i(sq_maskv),
-        .sdata_i(sq_sdata), .fok_i(sq_fok),
+        .sqv_i(sqv), .flag_i(sq_flagv), .addr_ok_i(sq_aokv), .paddr_i(fpa[k]), .mask_i(fmk[k]),
+        .sdata_i(fsd[k]), .fok_i(sq_fok),
         .ld_pa_i(l1[k].pa), .ld_mask_i(l1[k].mask), .ld_sq_i(l1[k].u.sq_idx),
         .hit_o(fw_hit[k]), .data_o(fw_data[k]), .wait_o(fw_wait[k]), .wsq_o(fw_wsq[k]));
+      o6_sq_lfwd #(.NSQ(NSQ)) u_lfwd (
+        .sqv_i(sqv), .flag_i(sq_flagv), .addr_ok_i(sq_aokv), .lm_i(lf_lm[k]), .vms_i(sq_vmsv),
+        .vd_i(sq_vd), .sd_i(sq_sdata), .fok_i(sq_fok),
+        .ld_mask_i(lf_need[k]), .ld_sq_i(l1[k].u.sq_idx),
+        .hit_o(lf_hit[k]), .data_o(lf_data[k]), .wait_o(lf_wait[k]), .wsq_o(lf_wsq[k]));
     end else begin : g_sta
       assign fw_hit[k] = '0; assign fw_data[k] = '0; assign fw_wait[k] = 1'b0; assign fw_wsq[k] = '0;
     end
@@ -973,6 +1193,26 @@ module o6_lsu
       sa_wsq[k]  = '{flag: |(po & sq_flagv), idx: wi};
     end
   end
+
+  // M3c：向量 load 的整行转发结果寄存到 L2 (要等的那条 store 在 L2 补翻转位，同 l2_fw_wsq)；STA 流水恒为 0
+  logic [CL_B-1:0] l2_lf_hit  [LSU_NP];
+  logic [CL_W-1:0] l2_lf_data [LSU_NP];
+  logic [CL_B-1:0] l2_lf_need [LSU_NP];
+  logic            l2_lf_wait [LSU_NP];
+  logic [SQ_W-1:0] l2_lf_wi   [LSU_NP];
+  sq_ptr_t         l2_lf_wsq  [LSU_NP];
+  always_ff @(posedge clk_i)
+    for (int k = 0; k < LSU_NP; k++) begin
+      int j;
+      j = (k < N_LDP) ? k : 0;
+      l2_lf_hit[k]  <= (k < N_LDP) ? lf_hit[j]  : '0;
+      l2_lf_data[k] <= (k < N_LDP) ? lf_data[j] : '0;
+      l2_lf_need[k] <= (k < N_LDP) ? lf_need[j] : '0;
+      l2_lf_wait[k] <= (k < N_LDP) && lf_wait[j];
+      l2_lf_wi[k]   <= (k < N_LDP) ? lf_wsq[j]  : '0;
+    end
+  always_comb
+    for (int k = 0; k < LSU_NP; k++) l2_lf_wsq[k] = '{flag: sq_flagv[l2_lf_wi[k]], idx: l2_lf_wi[k]};
 
   logic        l2_sa_wait [LSU_NP];
   sq_ptr_t     l2_sa_wsq  [LSU_NP];
@@ -1000,9 +1240,10 @@ module o6_lsu
   // L2：判定
   //==========================================================================
   typedef enum logic [3:0] {R_OK, R_EXCP, R_WAITSQ, R_MISS, R_NACK, R_MMIO, R_STA, R_AMOADDR, R_REPLAY,
-                            R_WAITSA} res_e;
+                            R_WAITSA, R_VNEXT} res_e;     // R_VNEXT (M3)：向量 load 第一遍写完，还要第二遍
   res_e        l2_res [LSU_NP];
   logic [LSU_NP-1:0] l2_live;
+  logic [LSU_NP-1:0] l2_vslow;    // M3：向量 load 数据 uop 以 replay 完成并要求走原路径
 
   // D$ load 口的返回按 LSU 流水编号展开 (STA 流水不用 D$ load 口，补 0)
   logic [LSU_NP-1:0] dcl_hit, dcl_nack;
@@ -1026,7 +1267,35 @@ module o6_lsu
     for (int k = 0; k < LSU_NP; k++) begin
       l2_live[k] = alive(l2_v[k], l2[k], br_upd_i, flush_i);
       l2_data[k] = '0;
+      l2_vslow[k] = 1'b0;
       if (l2[k].tlbmiss && !l2[k].rp)              l2_res[k] = R_REPLAY;
+      else if (l2[k].u.vml) begin
+        // M3 向量 load 数据 uop：异常 / MMIO (检查 uop 通过后不应出现) 或第二遍要跨页 -> replay 并走原路径；
+        //   bank 冲突、缺失同标量；vd 旧值源还在忙 (要补尾部的第一遍) 当冲突重试。
+        //   M3c：老 store 按字节转发 (整行搜索)，要转发的数据没好时等它 (WAITSQ)；本遍要的字节全来自转发时不看 D$
+        logic vxr, fc;
+        vxr = !l2[k].vpass && (int'(l2[k].voff) + int'(l2[k].u.vnb) > CL_B);
+        fc  = (l2_lf_need[k] & ~l2_lf_hit[k]) == '0;
+        if (l2[k].excp || l2[k].mmio)              begin l2_res[k] = R_REPLAY; l2_vslow[k] = 1'b1; end
+        else if (l2_lf_wait[k])                    l2_res[k] = R_WAITSQ;
+        else if (!fc && dcl_nack[k])               l2_res[k] = R_NACK;
+        else if (!fc && !dcl_hit[k])               l2_res[k] = R_MISS;
+        else if (!l2[k].vpass && l2[k].u.vps[2].use_ && !l2[k].u.vps[2].cr && vbusy_i[l2[k].u.vps[2].p])
+                                                   l2_res[k] = R_NACK;
+        // M4a：掩码 v0 还在忙 (两遍都要按它写)
+        else if (l2[k].u.vmk && !l2[k].u.vps[3].cr && vbusy_i[l2[k].u.vps[3].p])
+                                                   l2_res[k] = R_NACK;
+        else if (vxr && l2[k].pa[11:CL_O] == '1) begin l2_res[k] = R_REPLAY; l2_vslow[k] = 1'b1; end
+        else if (vxr)                              l2_res[k] = R_VNEXT;
+        else                                       l2_res[k] = R_OK;
+      end
+      else if (l2[k].u.vms) begin
+        // M3b 向量 store 数据 uop 的 STA：异常 / MMIO (检查 uop 通过后不应出现) 或窗口跨页 -> replay 并走原路径
+        logic vxr;
+        vxr = int'(l2[k].voff) + int'(l2[k].u.vnb) > CL_B;
+        if (l2[k].excp || l2[k].mmio || (vxr && l2[k].pa[11:CL_O] == '1)) begin l2_res[k] = R_REPLAY; l2_vslow[k] = 1'b1; end
+        else                                       l2_res[k] = R_STA;
+      end
       else if (l2[k].u.fu == FU_ST)                l2_res[k] = l2[k].excp ? R_EXCP : R_STA;
       else if (l2[k].u.fu == FU_AMO && !l2[k].pre) l2_res[k] = l2[k].excp ? R_EXCP : R_AMOADDR;
       else if (l2[k].excp)                         l2_res[k] = R_EXCP;
@@ -1058,7 +1327,7 @@ module o6_lsu
         lq_pexcl[l1[k].lqi] = 1'b1;
       // 等价于 l2_res 为 WAITSA / WAITSQ，但不经过 l2_res 编码 (它还依赖 D$ 命中等晚到的输入)
       if (l2_v[k] && l2[k].u.fu == FU_LD && !(l2[k].tlbmiss && !l2[k].rp) && !l2[k].excp && !l2[k].pre &&
-          !l2[k].mmio && (l2_sa_wait[k] || l2_fw_wait[k]))
+          !l2[k].mmio && (l2[k].u.vml ? l2_lf_wait[k] : (l2_sa_wait[k] || l2_fw_wait[k])))
         lq_pexcl[l2[k].lqi] = 1'b1;
     end
   end
@@ -1155,6 +1424,48 @@ module o6_lsu
     end
   end
   always_comb for (int k = 0; k < N_LDP; k++) iwb_pn_o[k] = l2[k].u.pdst;
+
+  // M3：向量 load 数据 uop 的整行 -> 寄存器字节位置。窗口 [off, off + nb) 跨行时：第一遍 = 本行 [off, 128) -> 寄存器 [0, n0)，
+  //   第二遍 = 下一行 [0, nb - n0) -> 寄存器 [n0, nb)，n0 = min(nb, 128 - off)
+  logic [CL_W-1:0] vl_d  [N_LDP];
+  logic [CL_B-1:0] vl_bm [N_LDP];
+  always_comb
+    for (int k = 0; k < N_LDP; k++) begin
+      int off, nb, n0;
+      logic [CL_W-1:0] ml;
+      off = int'(l2[k].voff); nb = int'(l2[k].u.vnb);
+      n0  = (nb < CL_B - off) ? nb : CL_B - off;
+      // M3c：转发来的字节盖在 D$ 读出的行上
+      for (int b = 0; b < CL_B; b++) ml[8*b +: 8] = l2_lf_hit[k][b] ? l2_lf_data[k][8*b +: 8] : dc_ld_line_i[k][8*b +: 8];
+      vl_bm[k] = '0;
+      if (!l2[k].vpass) begin
+        vl_d[k] = ml >> (8 * off);
+        for (int b = 0; b < CL_B; b++) vl_bm[k][b] = (b < n0);
+      end else begin
+        vl_d[k] = ml << (8 * n0);
+        for (int b = 0; b < CL_B; b++) vl_bm[k][b] = (b >= n0) && (b < nb);
+      end
+    end
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin vlw_v_o <= '0; vml_slow_o <= 1'b0; end
+    else begin
+      for (int k = 0; k < N_LDP; k++)
+        vlw_v_o[k] <= l2_live[k] && l2[k].u.vml && (l2_res[k] == R_OK || l2_res[k] == R_VNEXT) && !flush_i;
+      vml_slow_o <= (|(l2_live & l2_vslow)) && !flush_i;      // load 流水 (向量 load) 与 STA 流水 (向量 store)
+    end
+  always_ff @(posedge clk_i)
+    for (int k = 0; k < N_LDP; k++) begin
+      vlw_pd_o[k]   <= l2[k].u.pdst;
+      vlw_d_o[k]    <= vl_d[k];
+      vlw_bm_o[k]   <= vl_bm[k];
+      vlw_ov_o[k]   <= !l2[k].vpass && l2[k].u.vps[2].use_;   // 第一遍把其余字节写成旧值 (尾部 / 第二遍的位置先占着)
+      vlw_old_o[k]  <= l2[k].u.vps[2];
+      vlw_last_o[k] <= (l2_res[k] == R_OK);
+      vlw_mk_o[k]   <= l2[k].u.vmk;
+      vlw_m0_o[k]   <= l2[k].u.vps[3];
+      vlw_k_o[k]    <= l2[k].u.vk;
+      vlw_eb_o[k]   <= l2[k].u.veb;
+    end
   always_ff @(posedge clk_i) begin
     for (int k = 0; k < N_LDP; k++) begin
       iwb_o[k].pdst <= l2[k].u.pdst; iwb_o[k].wen <= 1'b1; iwb_o[k].data <= l2_fmt[k];
@@ -1204,7 +1515,7 @@ module o6_lsu
   wire  [PA_W-1:0] sqh_pa = pa_adv_q ? pa_h1_q : pa_h0_q;
   // 向量访存占口时，下一条是 T 级的那一行 (D$ 在 A 完成那拍预查它的标签，背靠背访问)
   // (C 空时是旧值：D$ 在 S_LOOK 核对地址不符就重查，只损失一拍)
-  assign dc_st_next_paddr_o = vm_own ? vc_pa[PA_W-1:0] : (pa_adv_q ? pa_h2_q : pa_h1_q);
+  assign dc_st_next_paddr_o = pa_adv_q ? pa_h2_q : pa_h1_q;      // 向量访存走专用行口 (P2.1)，不再借 store 口
   // 排空用的其余字段 (就绪、对齐后的数据、掩码、宽度、类型) 也寄存"头 / 头+1"副本：
   // 就绪的几个条件 (有效、已提交、地址、数据) 一旦成立只会在出队时清掉，晚一拍的副本只会更保守
   typedef struct packed {
@@ -1228,8 +1539,10 @@ module o6_lsu
   wire head_amo_v = sqv[sq_head.idx] && sqh.is_amo && !sqh.amo_done && sqh.addr_ok && sqh.fchk && !sqh.fault && sqh.data_ok &&
                     sqh.rob == rob_head_i && !amo_res_v;
 
+  // I2a：SQ 头是比未完成的异步向量 load 更年轻的 store / AMO 时不排空、不执行 (向量 load 要读到它们之前的值)
+  wire vbar_blk   = vbar_v_i && sq_head == vbar_i;
   wire start_mmio = (hst == H_IDLE) && head_mmio_v && head_go_i && sq_drained_o;
-  wire start_amo  = (hst == H_IDLE) && !start_mmio && head_amo_v && head_go_i && !ptw_own && !drain_own;
+  wire start_amo  = (hst == H_IDLE) && !start_mmio && head_amo_v && head_go_i && !ptw_own && !drain_own && !vbar_blk;
   assign head_start_o = start_mmio || start_amo;
 
   // SC 是否成功
@@ -1249,9 +1562,83 @@ module o6_lsu
   wire  ptw_sel   = ptw_mem_req_i && port_free && !dc_done_q;
   // 查表地址只看寄存的占用状态：AMO 进行中 / 排空 -> SQ 头副本；PTW 已占口 -> PTW 地址。
   // 请求第一拍 (占用还没建立) D$ 只查表不动作，第二拍起占用已寄存，与实际请求地址一致
-  assign dc_st_lk_paddr_o = vm_own ? va_pa :
-                            (ptw_own && !(hst == H_AMO || hst == H_AMO_WAIT)) ? {ptw_mem_addr_i[PA_W-1:3], 3'b000} : sqh_pa;
+  assign dc_st_lk_paddr_o = (ptw_own && !(hst == H_AMO || hst == H_AMO_WAIT)) ? {ptw_mem_addr_i[PA_W-1:3], 3'b000} : sqh_pa;
   wire  sq_head_ready = sqv[sq_head.idx] && sqh.committed && sqh.addr_ok && sqh.data_ok;   // AMO 释放用 (实时)
+
+  // U (统一 4 行槽，docs/11 §7b)：store 按行合并排空。SQ 头起最多 NCB 条连续的已提交 store，与头同一行、都不是 AMO / MMIO、
+  //   不跨未完成的异步向量 load 的界 (vbar)，合成一次 D$ 整行写 (按程序序合并字节，后面的覆盖前面的)，完成时一起出队。
+  //   条数在请求开始那拍锁存 (请求要保持到 done，期间又提交的不再并进来)。出队多条的下一拍 SQ 头的寄存副本不对，停一拍
+  //   M2：按 128 B 行合并，最多 8 条
+  localparam int NCB = 8;
+  logic [3:0]   cb_n, cb_nq, cb_use;
+  logic [CL_W-1:0] cb_ld;
+  logic [CL_B-1:0] cb_lm;
+  logic         pa_skip_q;
+  always_comb begin
+    logic go;
+    cb_n = 4'd1; go = !sqh.vms;            // M3b：向量 store 单独排空 (不与标量 store 合并)
+    for (int i = 1; i < NCB; i++) begin
+      sq_ptr_t p;
+      sq_ent_t e;
+      p = sq_inc(sq_head, 4'(i));
+      e = sq[p.idx];
+      if (go && sqv[p.idx] && e.committed && e.addr_ok && e.data_ok && !e.is_amo && !e.mmio && !e.vms &&
+          e.paddr[PA_W-1:CL_O] == sqh.paddr[PA_W-1:CL_O] && !(vbar_v_i && p == vbar_i)) cb_n = 4'(i + 1);
+      else go = 1'b0;
+    end
+    cb_use = drain_own ? cb_nq : cb_n;
+    cb_ld = '0; cb_lm = '0;
+    for (int i = 0; i < NCB; i++)
+      if (4'(i) < cb_use) begin
+        sq_ptr_t     p;
+        sq_ent_t     e;
+        logic [63:0] d;
+        p = sq_inc(sq_head, 4'(i));
+        e = sq[p.idx];
+        d = e.data << {e.paddr[2:0], 3'b000};
+        for (int b = 0; b < 8; b++)
+          if (e.mask[b]) begin cb_ld[64*e.paddr[CL_O-1:3] + 8*b +: 8] = d[8*b +: 8]; cb_lm[8*e.paddr[CL_O-1:3] + b] = 1'b1; end
+      end
+  end
+
+  // M3c 旋转器：向量 store 的数据 (VX 送来时按寄存器字节序) 与地址都到了以后，循环左移 off = vpa0[6:0] 字节，
+  //   改成按行内偏移放 (寄存器字节 i 在行内 (off + i) mod 128：第一行 [off, 128)，跨行的其余在第二行 [0, ...))。
+  //   每拍一项 (从 SQ 头起最老的)，旋转后才置 data_ok (可转发、可排空)。VX 每拍至多送一项，旋转器跟得上
+  logic            rot_v;
+  logic [SQ_W-1:0] rot_idx;
+  logic [CL_W-1:0] rot_d;
+  logic [CL_B-1:0] rot_m;
+  always_comb begin
+    logic [NSQ-1:0]    c, hi, pk;
+    logic [2*CL_W-1:0] d2;
+    logic [2*CL_B-1:0] m2;
+    for (int e = 0; e < NSQ; e++) c[e] = sqv[e] && sq[e].vms && sq[e].vraw && sq[e].addr_ok;
+    for (int e = 0; e < NSQ; e++) hi[e] = c[e] && (SQ_W'(e) >= sq_head.idx);
+    pk = (|hi) ? hi : c;
+    rot_v = |c; rot_idx = '0;
+    for (int e = NSQ - 1; e >= 0; e--) if (pk[e]) rot_idx = SQ_W'(e);
+    d2    = {sq_vd[rot_idx], sq_vd[rot_idx]} << (8 * int'(sq[rot_idx].vpa0[CL_O-1:0]));
+    rot_d = d2[2*CL_W-1:CL_W];
+    m2    = {sq_vbm[rot_idx], sq_vbm[rot_idx]} << int'(sq[rot_idx].vpa0[CL_O-1:0]);
+    rot_m = m2[2*CL_B-1:CL_B];
+  end
+
+  // M3b：SQ 头是向量 store 时本次写的行 (数据已按行内偏移放好，M3c)；第一次写窗口所在的行，跨行时第二次 (vpass) 写下一行
+  logic [CL_W-1:0] vs_ld;
+  logic [CL_B-1:0] vs_lm;
+  logic            vs_x;              // 窗口跨行
+  always_comb begin
+    logic [2*CL_B-1:0] m;
+    int                o, nb;
+    o  = int'(sqh.vpa0[CL_O-1:0]);
+    nb = int'(sqh.vnb);
+    m  = ((2*CL_B)'(1) << nb) - 1'b1;
+    m  = m << o;
+    vs_x  = o + nb > CL_B;
+    vs_ld = sq_vd[sq_head.idx];
+    vs_lm = (sqh.vpass ? m[2*CL_B-1:CL_B] : m[CL_B-1:0]) & sq_vbm[sq_head.idx];   // M4a：带掩码的只写掩码为 1 的字节
+  end
+  wire vms_p0x = sqh.vms && !sqh.vpass && vs_x;    // 本次是跨行向量 store 的第一次 (完成后不出队，改写下一行)
 
   always_comb begin
     dc_st_req_o    = 1'b0;
@@ -1261,8 +1648,8 @@ module o6_lsu
     dc_st_amo_o    = 1'b0;
     dc_st_amo_op_o = hs.amo_op;
     dc_st_line_o   = 1'b0;
-    dc_st_ldata_o  = va_wd;
-    dc_st_lmask_o  = va_wm;
+    dc_st_ldata_o  = '0;                // 整行模式只剩 Zicbom / Zicboz (向量走专用行口)
+    dc_st_lmask_o  = '0;
     dc_st_size_o   = hs.sz;
     mmio_req_o     = 1'b0;
     mmio_we_o      = 1'b0;
@@ -1285,19 +1672,12 @@ module o6_lsu
       if (amo_is_cbo(sqh.amo_op)) begin
         dc_st_line_o  = 1'b1;
         dc_st_ldata_o = '0;
-        dc_st_lmask_o = '1;
+        // Zicboz 的块大小保持 64 B (与 Spike 一致)：只写地址 [6] 那半行；clean / flush 不看掩码 (整行读后写回 / 作废)
+        dc_st_lmask_o = sqh.paddr[6] ? {{(CL_B/2){1'b1}}, {(CL_B/2){1'b0}}} : {{(CL_B/2){1'b0}}, {(CL_B/2){1'b1}}};
         dc_st_amo_o   = (sqh.amo_op != AMO_CBOZ);
       end
     end else if (vm_own) begin
-      // 向量访存：读按 AMO_LR (只读)，写按普通 store (字节掩码)
-      dc_st_req_o    = 1'b1;
-      dc_st_paddr_o  = va_pa;
-      dc_st_line_o   = 1'b1;
-      dc_st_data_o   = va_wd[63:0];
-      dc_st_mask_o   = 8'hFF;
-      dc_st_amo_o    = !va_we;
-      dc_st_amo_op_o = AMO_LR;
-      dc_st_size_o   = 2'd3;
+      // 向量访存占着 D$ (专用行口，P2.1)：store 口这期间不给排空 / PTW 用
     end else if (ptw_own || ptw_sel) begin
       dc_st_req_o    = ptw_own || ptw_take;
       dc_st_paddr_o  = {ptw_mem_addr_i[PA_W-1:3], 3'b000};
@@ -1305,10 +1685,17 @@ module o6_lsu
       dc_st_amo_op_o = AMO_LR;            // 只读
       dc_st_size_o   = 2'd3;
       dc_st_mask_o   = 8'hFF;
-    end else if (hs.ok && !hs.is_amo) begin
+    end else if (hs.ok && !hs.is_amo && (!vbar_blk || drain_own) && !pa_skip_q) begin
       // MMIO store 走 MMIO 口，不占 D$ 口
       if (hs.mmio) begin drain_go = 1'b1; mmio_req_o = 1'b1; mmio_we_o = 1'b1; drain_mmio = 1'b1; end
-      else if (!ptw_mem_req_i || drain_own) begin drain_go = 1'b1; dc_st_req_o = 1'b1; end
+      else if (!ptw_mem_req_i || drain_own) begin
+        drain_go = 1'b1; dc_st_req_o = 1'b1;
+        if (sqh.vms) begin                            // M3b：向量 store 按行写 (整行模式 + 字节掩码)
+          dc_st_line_o = 1'b1; dc_st_ldata_o = vs_ld; dc_st_lmask_o = vs_lm;
+        end else if (cb_use > 4'd1) begin             // U / M2：多条合并成整行写
+          dc_st_line_o = 1'b1; dc_st_ldata_o = cb_ld; dc_st_lmask_o = cb_lm;
+        end
+      end
     end
   end
 
@@ -1318,13 +1705,21 @@ module o6_lsu
 
   wire drain_done = drain_go && (drain_mmio ? mmio_ack_i : dc_st_done_i);
   wire amo_free   = sq_head_ready && sqh.is_amo && sqh.amo_done && hst == H_IDLE;   // 已执行的 AMO 提交后直接释放
-  wire sq_pop     = drain_done || amo_free;
+  wire vms_p0_done = drain_done && !drain_mmio && vms_p0x;   // M3b：跨行向量 store 第一次写完 (项留着，下一拍起写下一行)
+  wire sq_pop     = (drain_done && !vms_p0_done) || amo_free;
+  // 本拍出队条数 (U：合并排空一次多条)
+  wire [3:0] sq_npop = (drain_done && !drain_mmio) ? cb_use : 4'(sq_pop);
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) pa_skip_q <= 1'b0;
+    else         pa_skip_q <= (sq_pop && sq_npop > 4'd1) || vms_p0_done;   // M3b：头的 paddr 改了，寄存副本晚一拍
+  always_ff @(posedge clk_i)
+    if (drain_go && !drain_own) cb_nq <= cb_n;
   always_ff @(posedge clk_i) begin
     // 无效项给 0 (上电后从未分配过的项载荷没有复位；分配时整项清零，有效项的地址总是确定值)
     pa_h0_q  <= sqv[sq_head.idx] ? sq[sq_head.idx].paddr : '0;
     pa_h1_q  <= sqv[SQ_W'(sq_head.idx + 1'b1)] ? sq[SQ_W'(sq_head.idx + 1'b1)].paddr : '0;
     pa_h2_q  <= sqv[SQ_W'(sq_head.idx + 2'd2)] ? sq[SQ_W'(sq_head.idx + 2'd2)].paddr : '0;
-    pa_adv_q <= sq_pop;
+    pa_adv_q <= sq_pop && sq_npop == 4'd1;
     hc0_q    <= mk_hc(sqv[sq_head.idx], sq[sq_head.idx]);
     hc1_q    <= mk_hc(sqv[SQ_W'(sq_head.idx + 1'b1)], sq[SQ_W'(sq_head.idx + 1'b1)]);
   end
@@ -1382,11 +1777,16 @@ module o6_lsu
 
   // T 拍：查 DTLB、页错误；C 拍：寄存的物理地址判 PMA / PMP (2026-10-25，6 GHz：TLB + PMP + 接收使能
   // 一拍串不下 (219 ps)，拆开后 T 的接收只等 TLB 命中、C 的前进只等 PMP)
-  logic            vm_pmp_ok;
-  o6_pmp #(.N(8)) u_vm_pmp (
-    .dec_i(pmpd_i), .pa_i(vc_pa[PA_W-1:0]), .priv_i(dctx_i.priv),
-    .acc_i(vc_we ? 3'b010 : 3'b001), .ok_o(vm_pmp_ok)
-  );
+  // P3：一次 VM_NL 行同页，翻译 / 页权限一次；PMA / PMP 每行各查 (PMP 粒度可小于页)
+  logic [VM_NL-1:0] vm_pmp_ok;
+  logic [PA_W-1:0]  vc_lpa [VM_NL];         // C 级各行的物理地址 (第 0 行带行内偏移，其余行从行首)
+  for (genvar j = 0; j < VM_NL; j++) begin : g_vm_pmp
+    assign vc_lpa[j] = (j == 0) ? vc_pa[PA_W-1:0] : {vc_pa[PA_W-1:6] + (PA_W-6)'(j), 6'd0};
+    o6_pmp #(.N(8)) u_vm_pmp (
+      .dec_i(pmpd_i), .pa_i(vc_lpa[j]), .priv_i(dctx_i.priv),
+      .acc_i(vc_we ? 3'b010 : 3'b001), .ok_o(vm_pmp_ok[j])
+    );
+  end
   always_comb begin
     logic [63:0] pa64;
     logic [7:0]  pm8;
@@ -1395,7 +1795,10 @@ module o6_lsu
     vm_tmiss = 1'b0; vm_pf = 1'b0; vm_af = 1'b0; vm_gf = 1'b0;
     pa64 = vt_va; pm8 = dtlb_perm[LSU_NP]; gp = dtlb_gperm[LSU_NP];
     vm_gx = {7'b0, dtlb_gpa[LSU_NP][56:10], vt_va[11:2]};
-    if (dctx_i.xl) begin
+    if (vt_cont) begin
+      // 突发的后续行 (P2.3)：与首行同页，首行已查过权限；物理地址 = 上一行 + 64 (行内偏移取本行的)
+      pa64 = {{(64-PA_W){1'b0}}, vl_pa[PA_W-1:6] + 1'b1, vt_va[5:0]};
+    end else if (dctx_i.xl) begin
       if (dctx_i.cn && !va_canon(vt_va, dctx_i.vam)) vm_pf = 1'b1;
       else if (!dctx_i.cn && vt_va[63:VA_W] != '0) begin vm_gf = 1'b1; vm_gx = {7'b0, vt_va[58:2]}; end
       else if (!dtlb_hit[LSU_NP])               vm_tmiss = 1'b1;
@@ -1420,57 +1823,267 @@ module o6_lsu
     vm_tpa = pa64;
   end
   // C 拍：向量访存只支持主存 (MMIO / 不存在的区域报访问错误，与 AMO 相同)
-  logic [1:0] vc_pm;
-  logic       c_af;
+  // 各行出错 (页错误 / guest 页错误对整页，即所有访问行；访问错误按行)；第一个出错的行 c_fk，它之前要访问的行 c_pre
+  logic [VM_NL-1:0] c_lf, c_pre;
+  logic [1:0]       c_fk;
   always_comb begin
-    vc_pm = pma(vc_pa, dbg_mode_i);
-    c_af  = vc_af || (!vc_pf && !vc_gf && (!vc_pm[1] || vc_pm[0] || !vm_pmp_ok));
+    logic [1:0] pm;
+    logic       seen;
+    c_lf = '0; c_pre = '0; c_fk = '0; seen = 1'b0;
+    for (int j = 0; j < VM_NL; j++) begin
+      pm = pma(64'(vc_lpa[j]), dbg_mode_i);
+      c_lf[j] = vc_ln[j] && (vc_pf || vc_gf || vc_af || !pm[1] || pm[0] || !vm_pmp_ok[j]);
+      if (c_lf[j] && !seen) begin seen = 1'b1; c_fk = 2'(j); end
+      if (!seen) c_pre[j] = vc_ln[j];
+    end
   end
+  wire c_any = |c_lf;
 
-  // C -> A：C 检查通过且 A 空 (要先拿到 D$ 口：SQ 排空、口空闲、不是 D$ 刚完成 store 后预查下一条那拍) 或 A 本拍完成
-  wire a_fin   = va_v && dc_st_done_i;
-  wire c_ok    = vc_v && !vc_pf && !vc_gf && !c_af;
-  wire take_ok = sq_drained_o && !ptw_own && !drain_own && (hst == H_IDLE) && !dc_done_q && !ptw_take;
-  wire c2a     = c_ok && (a_fin || (!va_v && take_ok));
-  // C 出错：等 A 空 (更老的那行已回) 再报，保证按序；T 里更年轻的那行同拍丢弃 (VU 出错即停，不再等它)
-  wire c_flt   = vc_v && (vc_pf || vc_gf || c_af) && !va_v;
+  // C -> A：C 检查通过且 A 空 (要先拿到 D$：SQ 排空、store 口空闲、不是 D$ 刚完成 store 后预查下一条那拍) 或 A 本拍完成。
+  // A 走 D$ 专用向量行口 (P2.1)：命中时每拍收一次 (dc_v_ack，P3 最多 VM_NL 行)，C -> A 背靠背；完成 (与读数据) 在收下的下一拍报。
+  // P3：某行访问错误而它之前还有要访问的行 -> 截短到之前的行照常进 A (va_ft)，完成那拍连同错误一起报；
+  //   A 里是截短的那次时 C 不再进 A，报错那拍丢弃 C / T (VECU 出错即停)
+  wire a_fin   = va_v && dc_v_ack_i;
+  wire vd_flt  = vd_q && vd_ft;                       // 本拍报 "前几行完成 + 后面出错"
+  wire c_ok    = vc_v && (!c_any || c_pre != '0);
+  // I2a：异步向量 load 只等比它老的 store 排空 (更年轻的已提交 store 被 vbar 挡在 SQ 里，等 sq_drained 会死锁)
+  wire take_ok = (vm_async_i ? (sq_head == vm_sqb_i) : sq_drained_o) &&
+                 !ptw_own && !drain_own && (hst == H_IDLE) && !dc_done_q && !ptw_take;
+  wire c2a     = c_ok && !vd_flt && (a_fin ? !va_ft : (!va_v && take_ok));
+  // C 整次出错 (第一个访问行就错)：等 A 空且更老那次的完成已报 (vd_q) 再报，保证按序；T 里更年轻的那次同拍丢弃
+  wire c_flt   = vc_v && c_any && c_pre == '0 && !va_v && !vd_q;
   // T -> C：命中 (或已判出页错误，带到 C 按序报) 且 C 空或本拍前进
-  wire t2c     = vt_v && !vt_pw && !vm_tmiss && (!vc_v || c2a) && !c_flt;
-  assign vm_ack_o = vm_req_i && !c_flt && (!vt_v || t2c);
+  wire t2c     = vt_v && !vt_pw && !vm_tmiss && (!vc_v || c2a) && !c_flt && !vd_flt;
+  assign vm_ack_o = vm_req_i && !c_flt && !vd_flt && (!vt_v || t2c);
   always_comb begin
-    vm_done_o  = a_fin || c_flt;
-    vm_fault_o = c_flt;
-    vm_cause_o = vc_we ? (vc_pf ? o6_isa_pkg::EXC_STORE_PAGE : vc_gf ? o6_isa_pkg::EXC_STORE_GPAGE : o6_isa_pkg::EXC_STORE_ACCESS)
-                       : (vc_pf ? o6_isa_pkg::EXC_LOAD_PAGE  : vc_gf ? o6_isa_pkg::EXC_LOAD_GPAGE  : o6_isa_pkg::EXC_LOAD_ACCESS);
+    logic fwe, fpf, fgf;
+    fwe = c_flt ? vc_we : vd_we;
+    fpf = c_flt && vc_pf;
+    fgf = c_flt && vc_gf;
+    vm_done_o  = vd_q || c_flt;
+    vm_fault_o = c_flt || vd_flt;
+    vm_flane_o = c_flt ? c_fk : vd_fk;
+    vm_cause_o = fwe ? (fpf ? o6_isa_pkg::EXC_STORE_PAGE : fgf ? o6_isa_pkg::EXC_STORE_GPAGE : o6_isa_pkg::EXC_STORE_ACCESS)
+                     : (fpf ? o6_isa_pkg::EXC_LOAD_PAGE  : fgf ? o6_isa_pkg::EXC_LOAD_GPAGE  : o6_isa_pkg::EXC_LOAD_ACCESS);
   end
-  assign vm_rdata_o = dc_st_lrdata_i;
+  assign vm_rdata_o        = dc_v_rdata_i;
+  // P2.4b：VECU 在 T / C 都空时可提前应答向量 load。剩下的行只在 A 级 (占着 D$，SQ 排空 / PTW 进不来，
+  //   所以更年轻的标量 store 不会先改掉它还没读的行) 或已读出、在回 VECU 的路上
+  assign vm_tce_o          = !vt_v && !vc_v;
+  // 向量 store 与更年轻的标量 load (P2.4a)：向量 store 在 ROB 头，LQ 里的 load 都比它年轻。
+  //   写一行那拍 (a_fin && va_we)：LQ 里已有地址的 load 同行，或 load 流水里有正在走的 (地址还没进 LQ，保守算冲突)
+  //   -> 冲突，VECU 应答时要求提交后冲刷 (那些 load 可能已读到旧值)。之后执行的 load 读到的是新值
+  always_comb begin
+    logic hit;
+    hit = |(rf_v | ag_v | l0_v | l1_v | l2_v);
+    for (int i = 0; i < NLQ; i++)
+      for (int j = 0; j < VM_NL; j++)
+        if (va_ln[j] && lqv[i] && lq[i].addr_ok && !lq[i].mmio) begin
+          logic [PA_W-1:6] h;
+          h = va_pa[PA_W-1:6] + (PA_W-6)'(j);
+          if (!lq[i].vml && lq[i].paddr[PA_W-1:6] == h) hit = 1'b1;
+          // M3：向量 load 数据 uop 的窗口至多跨两行 (128 B)
+          if (lq[i].vml && (lq[i].vpa0[PA_W-1:CL_O] == h[PA_W-1:CL_O] || lq[i].vpa0[PA_W-1:CL_O] + 1'b1 == h[PA_W-1:CL_O]))
+            hit = 1'b1;
+        end
+    vm_conf_o = a_fin && va_we && hit;
+  end
+  assign dc_v_req_o        = va_v;
+  assign dc_v_paddr_o      = va_pa;
+  assign dc_v_ln_o         = va_ln;
+  assign dc_v_next_paddr_o = vc_pa[PA_W-1:0];
+  assign dc_v_we_o         = va_we;
+  assign dc_v_wdata_o      = va_wd;
+  assign dc_v_wmask_o      = va_wm;
+  // 一次里编号最大的访问行 (突发的后续行接在它后面)
+  function automatic logic [1:0] lastl(input logic [VM_NL-1:0] ln);
+    logic [1:0] r;
+    r = '0;
+    for (int j = 0; j < VM_NL; j++) if (ln[j]) r = 2'(j);
+    return r;
+  endfunction
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin vd_q <= 1'b0; vd_ft <= 1'b0; vc_ok_q <= 1'b0; end
+    else begin
+      vd_q    <= a_fin;
+      vd_ft   <= a_fin && va_ft;
+      vc_ok_q <= c_ok && !c2a;              // 下一拍 C 里还是这一次
+    end
+  always_ff @(posedge clk_i) begin
+    if (a_fin) begin vd_we <= va_we; vd_fk <= va_fk; end
+    if (t2c)   vl_pa <= {vm_tpa[PA_W-1:6] + (PA_W-6)'(lastl(vt_ln)), 6'd0};
+  end
+`ifndef SYNTHESIS
+  // 读的完成那拍 D$ 正好给出数据
+  always_ff @(posedge clk_i) if (rst_ni && vd_q) assert (vd_we || dc_v_rv_i) else $error("lsu: 向量读完成时 D$ 行口没有读数据");
+  // 后续行紧接在上一次之后、同一页；一次里的各行也在同一页 (VECU 保证)
+  always_ff @(posedge clk_i) if (rst_ni && t2c && vt_cont)
+    assert (vm_tpa[11:6] != 6'd0) else $error("lsu: 向量突发的后续行跨页");
+  always_ff @(posedge clk_i) if (rst_ni && t2c)
+    assert (vt_ln != '0 && 7'(vm_tpa[11:6]) + 7'(lastl(vt_ln)) <= 7'd63) else $error("lsu: 向量访存一次的行 %b 为空或跨页", vt_ln);
+`endif
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       vt_v <= 1'b0; vc_v <= 1'b0; va_v <= 1'b0; vt_pw <= 1'b0;
     end else begin
       if (vm_ack_o) vt_v <= 1'b1;
-      else if (t2c || c_flt) vt_v <= 1'b0;
+      else if (t2c || c_flt || vd_flt) vt_v <= 1'b0;
       if (t2c) vc_v <= 1'b1;
-      else if (c2a || c_flt) vc_v <= 1'b0;
+      else if (c2a || c_flt || vd_flt) vc_v <= 1'b0;
       if (c2a) va_v <= 1'b1;
       else if (a_fin) va_v <= 1'b0;
       // TLB 缺失：等 C、A 都空 (D$ 口放掉，PTW 要用；C 不会再出错丢弃 T) 再请求页表遍历，回填后重查
       if (dfill_i) vt_pw <= 1'b0;
-      else if (vt_v && vm_tmiss && !va_v && !vc_v) vt_pw <= 1'b1;
+      else if (vt_v && vm_tmiss && !va_v && !vc_v && !vd_q) vt_pw <= 1'b1;
     end
   end
   always_ff @(posedge clk_i) begin
-    if (vm_ack_o) begin vt_va <= pm_x(vm_va_i, dctx_i.pmm, dctx_i.zx); vt_we <= vm_we_i; vt_wd <= vm_wdata_i; vt_wm <= vm_wmask_i; end
-    if (t2c) begin vc_pa <= vm_tpa; vc_we <= vt_we; vc_pf <= vm_pf; vc_af <= vm_af; vc_gf <= vm_gf; vc_gx <= vm_gx; vc_wd <= vt_wd; vc_wm <= vt_wm; end
+    if (vm_ack_o) begin
+      vt_va <= pm_x(vm_va_i, dctx_i.pmm, dctx_i.zx); vt_we <= vm_we_i; vt_cont <= vm_cont_i; vt_ln <= vm_ln_i;
+      vt_wd <= vm_wdata_i; vt_wm <= vm_wmask_i;
+    end
+    if (t2c) begin
+      vc_pa <= vm_tpa; vc_we <= vt_we; vc_pf <= vm_pf; vc_af <= vm_af; vc_gf <= vm_gf; vc_gx <= vm_gx; vc_ln <= vt_ln;
+      vc_wd <= vt_wd; vc_wm <= vt_wm;
+    end
     if (c_flt) vm_x2_o <= vc_gf ? vc_gx : 64'd0;
-    if (c2a) begin va_pa <= vc_pa[PA_W-1:0]; va_we <= vc_we; va_wd <= vc_wd; va_wm <= vc_wm; end
+    else if (vd_flt) vm_x2_o <= 64'd0;
+    if (c2a) begin
+      va_pa <= vc_pa[PA_W-1:0]; va_we <= vc_we; va_wd <= vc_wd; va_wm <= vc_wm;
+      va_ln <= c_any ? c_pre : vc_ln;                // 截短：只访问出错行之前的行
+      va_ft <= c_any; va_fk <= c_fk;
+    end
   end
 `ifndef SYNTHESIS
-  // C 出错丢弃 T 那行时它不能在做页表遍历 (遍历只在 C、A 都空时发起)
-  always_ff @(posedge clk_i) if (rst_ni && c_flt && vt_v)
+  // C 出错丢弃 T 那次时它不能在做页表遍历 (遍历只在 C、A 都空时发起)
+  always_ff @(posedge clk_i) if (rst_ni && (c_flt || vd_flt) && vt_v)
     assert (!vt_pw) else $error("lsu: 向量 C 级出错时 T 级正在页表遍历");
+  // I2a：比未完成的异步向量 load 更年轻的 store 不排空 (界在 SQ 头时)
+  always_ff @(posedge clk_i) if (rst_ni && drain_done && vbar_v_i)
+    assert (sq_head != vbar_i) else $error("lsu: SQ 头的 store 越过了未完成的异步向量 load 排空");
+  // 异步向量 load 访问 D$ 时比它老的 store 都已排空
+  always_ff @(posedge clk_i) if (rst_ni && c2a && vm_async_i)
+    assert (sq_head == vm_sqb_i) else $error("lsu: 异步向量 load 访问时比它老的 store 还没排空");
 `endif
+
+  //==========================================================================
+  // I2a 向量 load 预查 VPC (docs/11 §9e)：单位步长类向量 load 在 P3 发射 (源就绪，不等 ROB 头)，EX 级送来基址。
+  //   查 [va, va + VEL_SPAN) (最大寄存器组 8 × 128 B；实际访问的范围是它的子集) 是否一定不会出错：
+  //   基址按 EEW 对齐、不用指针掩码、翻译命中且读权限够 (跨页时两页都查)、整段在主存 (PMA)、PMP 整段落在同一项里且可读。
+  //   都满足 -> 完成 (提交时送 VECU，访存在提交后异步做)；否则 replay (重取后走 ROB 头同步的原路径，异常照原样精确报)。
+  //   T：查 DTLB 两个专用口 (基址页 / 末字节页)，判翻译与页权限；C：寄存的物理区间判 PMA / PMP；再寄存一拍出完成。
+  //   TLB 缺失也 replay (原路径会走页表遍历)。不改 DTLB / D$ 状态，也不受 VECU 访存口占用影响，每拍可收一条
+  //==========================================================================
+  rob_ptr_t        pv_rob;
+  br_mask_t        pv_bm;
+  logic            pv_bad;          // T 之前就能判的：不对齐 / 指针掩码
+  logic            pv_we, pc_we;    // M3b：向量 store 的检查 uop (查写权限：页 W / D、G-stage W / D、PMP W)
+  logic            pc_v, pc_bad, pc_x;
+  rob_ptr_t        pc_rob;
+  br_mask_t        pc_bm;
+  logic [PA_W-1:0] pc_lo0, pc_hi0, pc_lo1, pc_hi1;   // 两段物理区间 (闭区间；不跨页时只有第 0 段)
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) begin pv_v <= 1'b0; pc_v <= 1'b0; vpc_cmpl_o.valid <= 1'b0; end
+    else begin
+      pv_v <= vpc_v_i && !flush_i && !br_killed(vpc_bm_i, br_upd_i);
+      pc_v <= pv_v && !flush_i && !br_killed(pv_bm, br_upd_i);
+      vpc_cmpl_o.valid <= pc_v && !flush_i && !br_killed(pc_bm, br_upd_i);
+    end
+  always_ff @(posedge clk_i) begin
+    pv_va  <= vpc_va_i;
+    pv_ve  <= vpc_va_i + 64'(VEL_SPAN - 1);
+    pv_rob <= vpc_rob_i;
+    pv_bm  <= vpc_bm_i & ~br_upd_i.resolve_mask;
+    pv_bad <= ((vpc_va_i & ((64'd1 << vpc_eb_i) - 64'd1)) != '0) || (dctx_i.pmm != 2'b00);
+    pv_we  <= vpc_we_i;
+  end
+  // T：两页的翻译 (读权限；与向量访存口 T 级同样的检查，不分页错误 / 访问错误，任何一种都算不通过)
+  function automatic logic vpc_tbad(input logic [63:0] va, input logic hit, input logic [1:0] flt,
+                                    input logic [7:0] pm8, input logic [3:0] gp, input xctx_t cx, input logic we);
+    logic b;
+    b = 1'b0;
+    if (cx.xl) begin
+      if (cx.cn && !va_canon(va, cx.vam))     b = 1'b1;
+      else if (!cx.cn && va[63:VA_W] != '0)   b = 1'b1;
+      else if (!hit || flt != 2'd0)           b = 1'b1;
+      else begin
+        if (cx.cn) begin
+          if (cx.priv == 2'b00 && !pm8[4])          b = 1'b1;
+          if (cx.priv == 2'b01 && pm8[4] && !cx.sum) b = 1'b1;
+          if (!pm8[6])                              b = 1'b1;
+          if (!we && !(pm8[1] || (cx.mxr && pm8[3]))) b = 1'b1;
+          if (we && (!pm8[2] || !pm8[7]))           b = 1'b1;     // 写：W 且 D (同 L0 的 STA 检查)
+        end
+        if (!we && !(gp[0] || (cx.gmxr && gp[2])))  b = 1'b1;
+        if (we && !(gp[0] && gp[1] && gp[3]))       b = 1'b1;
+      end
+    end
+    return b;
+  endfunction
+  always_ff @(posedge clk_i) begin
+    logic        x, b0, b1;
+    logic [63:0] p0, p1, e0;
+    x  = pv_va[63:12] != pv_ve[63:12];
+    b0 = vpc_tbad(pv_va, dtlb_hit[LSU_NP+1], dtlb_fault[LSU_NP+1], dtlb_perm[LSU_NP+1], dtlb_gperm[LSU_NP+1], dctx_i, pv_we);
+    b1 = x && vpc_tbad(pv_ve, dtlb_hit[LSU_NP+2], dtlb_fault[LSU_NP+2], dtlb_perm[LSU_NP+2], dtlb_gperm[LSU_NP+2], dctx_i, pv_we);
+    p0 = dctx_i.xl ? {{(64-PA_W){1'b0}}, dtlb_ppn[LSU_NP+1], pv_va[11:0]} : pv_va;
+    p1 = dctx_i.xl ? {{(64-PA_W){1'b0}}, dtlb_ppn[LSU_NP+2], pv_ve[11:0]} : pv_ve;
+    e0 = x ? {p0[63:12], 12'hFFF} : p1;                      // 第 0 段到基址页末 (不跨页时到末字节)
+    pc_x   <= x;
+    pc_bad <= pv_bad || b0 || b1 || p0[63:PA_W] != '0 || p1[63:PA_W] != '0;
+    pc_lo0 <= p0[PA_W-1:0];
+    pc_hi0 <= e0[PA_W-1:0];
+    pc_lo1 <= {p1[PA_W-1:12], 12'h000};
+    pc_hi1 <= p1[PA_W-1:0];
+    pc_rob <= pv_rob;
+    pc_we  <= pv_we;
+    pc_bm  <= pv_bm & ~br_upd_i.resolve_mask;
+  end
+  // C：PMA (两端都在主存：主存是一段连续区间) 与 PMP (区间与各项的关系：最低号相交的项必须整段包含它且可读；
+  //   都不相交时 M 态允许、S/U 拒绝)。PMP 地址按 PA[55:2] 比
+  function automatic logic vpc_pmp(input pmp_dec_t d [8], input logic [PA_W-1:0] lo, input logic [PA_W-1:0] hi,
+                                   input logic [1:0] priv, input logic we);
+    logic [53:0] al, ah, b0, b1;
+    logic        found, ok, ov, inr;
+    al = 54'(lo[PA_W-1:2]); ah = 54'(hi[PA_W-1:2]);
+    found = 1'b0; ok = (priv == 2'b11);
+    for (int i = 0; i < 8; i++) begin
+      ov = 1'b0; inr = 1'b0;
+      if (d[i].tor) begin
+        ov  = (d[i].lo < d[i].hi) && (al < d[i].hi) && (ah >= d[i].lo);
+        inr = (al >= d[i].lo) && (ah < d[i].hi);
+      end else if (d[i].nap) begin
+        b0  = d[i].lo & d[i].hi;
+        b1  = d[i].lo | ~d[i].hi;
+        ov  = (al <= b1) && (ah >= b0);
+        inr = (al >= b0) && (ah <= b1);
+      end
+      if (!found && ov) begin
+        found = 1'b1;
+        if (!inr)                                ok = 1'b0;
+        else if (priv == 2'b11 && !d[i].lk)      ok = 1'b1;
+        else                                     ok = we ? d[i].xwr[1] : d[i].xwr[0];
+      end
+    end
+    return ok;
+  endfunction
+  always_ff @(posedge clk_i) begin
+    logic ok;
+    ok = !pc_bad &&
+         pma(64'(pc_lo0), dbg_mode_i) == 2'b10 && pma(64'(pc_hi0), dbg_mode_i) == 2'b10 &&
+         vpc_pmp(pmpd_i, pc_lo0, pc_hi0, dctx_i.priv, pc_we);
+    if (pc_x)
+      ok = ok && pma(64'(pc_lo1), dbg_mode_i) == 2'b10 && pma(64'(pc_hi1), dbg_mode_i) == 2'b10 &&
+           vpc_pmp(pmpd_i, pc_lo1, pc_hi1, dctx_i.priv, pc_we);
+    vpc_cmpl_o.rob_idx     <= pc_rob;
+    vpc_cmpl_o.excp        <= 1'b0;
+    vpc_cmpl_o.cause       <= '0;
+    vpc_cmpl_o.tval        <= '0;
+    vpc_cmpl_o.flush_after <= 1'b0;
+    vpc_cmpl_o.replay      <= !ok;
+    vpc_cmpl_o.fflags      <= '0;
+  end
 
   //==========================================================================
   // LQ / SQ 状态更新
@@ -1495,8 +2108,13 @@ module o6_lsu
       sq_cmt <= sc;
       sh = sq_head;
       if (sq_pop) begin
-        sqv[sq_head.idx] <= 1'b0;
-        sh = sq_inc(sq_head, 4'd1);
+        for (int i = 0; i < NCB; i++)
+          if (4'(i) < sq_npop) begin
+            sq_ptr_t p;
+            p = sq_inc(sq_head, 4'(i));
+            sqv[p.idx] <= 1'b0;
+          end
+        sh = sq_inc(sq_head, sq_npop);
       end
       sq_head <= sh;
 
@@ -1572,6 +2190,8 @@ module o6_lsu
           e.sz = u.mem_sz; e.uns = u.mem_unsigned; e.rd_class = u.rd_class; e.fp_dbl = u.fp_dbl;
           e.pdst = u.pdst; e.sq_bound = u.sq_idx; e.st = LS_NEW; e.wk = WK_NONE;
           e.ld_wait = u.ld_wait; e.ftq_idx = u.ftq_idx; e.ftq_off = u.ftq_off;
+          e.vml = u.vml; e.vnb = u.vnb; e.vold = u.vps[2]; e.vpass = 1'b0;
+          e.vmk = u.vmk; e.vm0 = u.vps[3]; e.vk = u.vk; e.veb = u.veb;
         end
       end
 
@@ -1584,6 +2204,7 @@ module o6_lsu
           e.addr_ok = 1'b1;      // 有异常的 load 也记地址 (只可能多报违例，它到头会陷入)
           e.paddr   = l0[k].pa;
           e.mask    = l0[k].mask;
+          e.vpa0    = l0[k].pa;  // M3：向量 load 的窗口起点 (第一遍)
           e.st      = LS_PIPE;
         end
       end
@@ -1600,7 +2221,13 @@ module o6_lsu
         if (l2_live[k] && l2[k].u.fu == FU_LD && l2[k].lqi == LQ_W'(i)) begin
           unique case (l2_res[k])
             R_OK, R_EXCP, R_REPLAY: e.st = LS_DONE;
-            R_WAITSQ: begin e.st = LS_WAIT; e.wk = WK_SQ; e.wk_sq = l2_fw_wsq[k]; end
+            // 等要转发的 store 的数据 (M3c：向量 load 用整行转发搜索给出的那条)
+            R_WAITSQ: begin
+              e.st = LS_WAIT; e.wk = WK_SQ;
+              e.wk_sq = l2[k].u.vml ? l2_lf_wsq[k] : l2_fw_wsq[k];
+            end
+            // M3：向量 load 第一遍写完 -> 第二遍从下一行起点 (同一页) 经端口 0 重放
+            R_VNEXT: begin e.st = LS_READY; e.vpass = 1'b1; e.paddr = {l2[k].pa[PA_W-1:CL_O] + 1'b1, CL_O'(0)}; end
             R_WAITSA: begin e.st = LS_WAIT; e.wk = WK_SQA; e.wk_sq = l2_sa_wsq[k]; end
             R_MISS: begin
               // 回填完成脉冲可能正好与本 load 的 L2 同拍 (它在 L1 时还看到旧状态并挂到这个 MSHR)：
@@ -1644,6 +2271,7 @@ module o6_lsu
           e.sz = u.mem_sz; e.is_amo = (u.fu == FU_AMO); e.amo_op = u.op;
           e.pdst = u.pdst; e.rd_class = u.rd_class; e.lq_bound = u.lq_idx;
           e.data_ok = (u.fu == FU_AMO && amo_nodata(u.op));    // LR / CBO 没有数据
+          e.vms = u.vms; e.vnb = u.vnb;
         end
       end
 
@@ -1655,6 +2283,7 @@ module o6_lsu
           e.addr_ok = 1'b1;
           e.paddr   = l0[k].pa;
           e.mask    = l0[k].mask;
+          e.vpa0    = l0[k].pa;     // M3b：向量 store 的窗口起点
         end
         if (l1_live_s[k-KS] && (l1[k].u.fu == FU_ST || l1[k].u.fu == FU_AMO) && !l1[k].rp &&
             !l1[k].tlbmiss && l1[k].u.sq_idx.idx == SQ_W'(x)) begin
@@ -1669,6 +2298,19 @@ module o6_lsu
       // STD
       for (int k = 0; k < N_STD; k++)
         if (std_valid_i[k] && std_sq_i[k].idx == SQ_W'(x)) begin e.data_ok = 1'b1; e.data = std_data_i[k]; end
+      // M3b：向量 store 数据 (128 B 在 sq_vd 里写)；M3c：先记 vraw，旋转器按行内偏移放好后才置 data_ok
+      if (vsd_v_i && vsd_sq_i.idx == SQ_W'(x)) e.vraw = 1'b1;
+      if (rot_v && rot_idx == SQ_W'(x)) begin e.vraw = 1'b0; e.data_ok = 1'b1; end
+      // M3b 排空预取已发
+      if (spf_go && spf_idx == SQ_W'(x)) begin
+        if (spf_2nd) e.pf1 = 1'b1;
+        else         e.pf0 = 1'b1;
+      end
+      // M3b：向量 store 跨行的第一次排空完成 -> 第二次写下一行 (同一页：跨页的在 STA 时已改走原路径)
+      if (vms_p0_done && sq_head.idx == SQ_W'(x)) begin
+        e.vpass = 1'b1;
+        e.paddr = {sq[x].vpa0[PA_W-1:CL_O] + 1'b1, CL_O'(0)};
+      end
 
       // AMO 执行完成
       if (hst == H_AMO_WAIT && ((sqh.amo_op == AMO_SC && !sc_ok) || dc_st_done_i) && sq_head.idx == SQ_W'(x))
@@ -1680,7 +2322,16 @@ module o6_lsu
   always_ff @(posedge clk_i) begin
     for (int i = 0; i < NLQ; i++) lq[i] <= lq_n[i];
     for (int x = 0; x < NSQ; x++) sq[x] <= sq_n[x];
+    if (vsd_v_i) begin sq_vd[vsd_sq_i.idx] <= vsd_d_i; sq_vbm[vsd_sq_i.idx] <= vsd_bm_i; end
+    if (rot_v)   begin sq_vd[rot_idx] <= rot_d; sq_vbm[rot_idx] <= rot_m; end   // M3c (与 vsd 不会同一项：vraw 是上拍起才有的)
   end
+`ifndef SYNTHESIS
+  // M3b：向量 store 数据只写给向量 store 数据 uop 的项 (有效、翻转位相符)
+  always_ff @(posedge clk_i)
+    if (rst_ni && vsd_v_i)
+      assert (sqv[vsd_sq_i.idx] && sq[vsd_sq_i.idx].flag == vsd_sq_i.flag && sq[vsd_sq_i.idx].vms)
+        else $error("lsu: 向量 store 数据写到的 SQ 项 %0d 不是向量 store", vsd_sq_i.idx);
+`endif
 
 `ifndef SYNTHESIS
   always_ff @(posedge clk_i) if (rst_ni) begin

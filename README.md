@@ -29,14 +29,14 @@ RISC-V 6-Issue Core 是一个 **6 发射乱序 RV64 应用处理器核**，参�
 | ISA | RV64 IMAFDC + B (Zba/Zbb/Zbs) + V + H，Zicsr / Zifencei / Zicntr / Zihpm |
 | RVA23 扩展 | Zicond、Zcb、Zfa、Zawrs、Zimop / Zcmop、Zicbom / Zicboz / Zicbop、Zvbb、Zfhmin / Zvfhmin、Sstc、Sscofpmf、Svinval、Svnapot、Svpbmt、Smstateen / Ssstateen、Ssnpm / Smnpm（指针掩码）等 |
 | 特权 | M / HS / U + VS / VU；Sv39 / **Sv48 / Sv57**；G-stage Sv39x4 / Sv48x4 / Sv57x4；PMP 8 项 |
-| 宽度 | 6 宽译码 / 重命名 / 分派 / 提交，15 个执行端口 |
+| 宽度 | 6 宽译码 / 重命名 / 分派 / 提交（其中向量每拍 ≤ 4 条），15 个标量执行端口 + 4 个向量执行器 |
 | 乱序窗口 | ROB 258 项（43 行 × 6），在途分支 48 个 |
 | 物理寄存器 | 整数 256 × 64 位，浮点 192 × 64 位 |
 | 访存 | LQ 128、SQ 64；3 条 load 流水 + 2 条 STA + 2 个 STD 口；load 投机唤醒；load → load 快速路径 |
-| 缓存 | L1I 64 KB 16 路，L1D 64 KB 16 路（15 个 MSHR + 步长预取），L2 1 MB 8 路（非阻塞） |
+| 缓存 | L1I 64 KB 16 路，L1D 128 KB 32 路 128 B 行（15 个 MSHR + 步长预取），L2 1 MB 8 路（非阻塞） |
 | 分支预测 | uBTB + uPHT（带历史）、BTB、TAGE-SC-L（8 张带标签表）、ITTAGE、链式 RAS，FTQ 64 项 |
 | 浮点 | cvfpu（FPnew）：FP64 / FP32（NaN-boxing），FMA 4 级流水；Zfa、Zfhmin |
-| 向量 | RVV 1.0 按序向量单元，与标量乱序核解耦，VLEN = 1024，含 FP8 与点积扩展 |
+| 向量 | RVV 1.0，VLEN = 1024；运算指令整条在核内改名、经 VIQ（64 项）乱序发给 4 个全流水执行器（每拍 1024 位，FP8 点积合计 512 MAC/拍）；向量访存与标量共用 LSU；VPRF 192 × 1024 位；含 FP8 与点积扩展 |
 | 系统 | CLINT、PLIC、UART16550、BootROM，RISC-V Debug 0.13.2（JTAG），每个 SRAM 一个 MBIST 引擎 |
 
 ---

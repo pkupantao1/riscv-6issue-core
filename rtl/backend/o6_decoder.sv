@@ -225,8 +225,9 @@ module o6_decoder
       end
       OPC_STORE_FP: begin
         if (vmem_w(f3)) begin
-          // 向量 store：不经过标量 SQ，更年轻的标量 load 可能已读到旧值 -> 完成后冲刷重取
-          u.fu = FU_VEC; u.wait_head = 1'b1; u.flush_after = 1'b1;
+          // 向量 store：不经过标量 SQ，更年轻的标量 load 可能已读到旧值 -> 完成后冲刷重取。
+          // P2.4a：只在确有冲突时冲刷 (LSU 写每行时比 LQ / load 流水，向量单元应答时经完成口置 flush_after)
+          u.fu = FU_VEC; u.wait_head = 1'b1;
           u.rs2_class = (i[27:26] == 2'b10) ? int_rc(rs2) : RC_NONE;
           ill = !vec_on;
         end else begin
@@ -244,6 +245,8 @@ module o6_decoder
         ill = !vec_on;
         unique case (f3)
           3'b111: begin                                  // vsetvli / vsetivli / vsetvl
+            // 改 vtype：更年轻的向量指令在译码级按旧 vtype 分的快 / 慢路径可能作废 -> 由向量单元应答时判定
+            // (快路径条件 fast_ok 变了才冲刷，P2.4a)，经完成口置 flush_after (docs/11 §9a)
             u.lrd = rd; u.rd_class = int_rc(rd);
             if (!i[31])                     u.rs1_class = int_rc(rs1);
             else if (i[31:30] == 2'b11)     u.rs1_class = RC_NONE;          // uimm
@@ -381,10 +384,11 @@ module o6_decoder
           if (f3[2]) u.rs1_class = RC_NONE;
           // 是否写 CSR：RW 总写；RS/RC 在 rs1 / zimm 非零时写
           u.flush_after = (f3[1:0] == 2'b01) || (rs1 != 5'd0);
-          // 向量 CSR 在向量单元：同步执行 (先等它排空)，不影响取指，不必冲刷
+          // 向量 CSR 在向量单元：同步执行 (先等它排空)，不影响取指，不必冲刷；
+          // 只有写 vstart 要冲刷：译码级按 vstart = 0 分快路径 (docs/11 §9a)
           if (i[31:20] == CSR_VSTART || i[31:20] == CSR_VXSAT || i[31:20] == CSR_VXRM || i[31:20] == CSR_VCSR ||
               i[31:20] == CSR_VL || i[31:20] == CSR_VTYPE || i[31:20] == CSR_VLENB) begin
-            u.fu = FU_VEC; u.flush_after = 1'b0;
+            u.fu = FU_VEC; u.flush_after = u.flush_after && (i[31:20] == CSR_VSTART);
             ill = !vec_on;
           end
         end

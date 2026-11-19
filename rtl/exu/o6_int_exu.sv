@@ -39,7 +39,7 @@ module o6_int_exu
   // FU_VEC 只在 ROB 头发射，比它老的都已写回，不需要旁路
   output preg_t               fprf_raddr_o,
   input  wire  [63:0]         fprf_rdata_i,
-  input  wire                 vu_idle_i,         // 向量单元空闲 (标量 CSR 指令等它：fflags / FS 由 VU 迟到地更新)
+  input  wire                 vecu_idle_i,         // 向量单元空闲 (标量 CSR 指令等它：fflags / FS 由 VECU 迟到地更新)
 
   // 写回寄存器 (旁路源)：W0..W6
   input  var wb_t [N_IWB-1:0] wb_i,          // 全部 7 个 (W4/W5 来自 LSU，W0-3/W6 来自本模块的输出回环)
@@ -107,9 +107,10 @@ module o6_int_exu
   output logic [63:0]         i2f_data_o,
   input  wire                 i2f_ready_i,
 
-  // 向量单元 (ROB 头的 FU_VEC，见 o6_vu)：EX 级发请求，回完成后结果走 W6
+  // 向量单元 (ROB 头的 FU_VEC，见 o6_vecu)：EX 级发请求，回完成后结果走 W6
   output logic                vec_req_o,
   output logic [31:0]         vec_inst_o,
+  output logic                vec_fast_o,        // 快路径 (重命名已分配向量物理寄存器，docs/11 §9a)
   output logic [63:0]         vec_a_o,
   output logic [63:0]         vec_b_o,
   input  wire                 vec_rsp_i,
@@ -117,6 +118,14 @@ module o6_int_exu
   input  wire                 vec_excp_i,
   input  wire  [5:0]          vec_cause_i,
   input  wire  [63:0]         vec_tval_i,
+  input  wire                 vec_flush_i,       // 应答：提交后冲刷 (P2.4a)
+  // I2a (docs/11 §9e)：预查后提前提交的向量 load (uop.vel) 在 EX 级把基址送 LSU 的 VPC (单拍，VPC 每拍可收)，P3 不等它
+  output logic                vpc_v_o,
+  output logic [63:0]         vpc_va_o,
+  output rob_ptr_t            vpc_rob_o,
+  output br_mask_t            vpc_bm_o,
+  output logic [1:0]          vpc_eb_o,          // EEW = 8 << eb (基址要按它对齐)
+  output logic                vpc_we_o,          // M3b：向量 store 的检查 uop (按写权限预查)
 
   // 头部执行状态
   input  wire                 ev_block_i,       // 提交级正在处理事件 (陷入 / 中断 / flush_after)
@@ -349,8 +358,17 @@ module o6_int_exu
   end
 
   // 向量：EX 级发请求 (单拍)，等完成；完成后结果锁存等 W6 (与 CSR 相同，只是完成可能晚很多拍)
-  assign vec_req_o  = head_ex_ok && ex_u[3].fu == FU_VEC;
+  assign vec_req_o  = head_ex_ok && ex_u[3].fu == FU_VEC && !ex_u[3].vel;
+  // I2a：vel 不等 ROB 头，EX 级送 VPC 预查 (分支杀已在 ex_live 里；本拍冲刷由 LSU 丢弃)
+  assign vpc_v_o    = ex_live[3] && ex_u[3].fu == FU_VEC && ex_u[3].vel;
+  assign vpc_va_o   = ex_a[3];
+  assign vpc_rob_o  = ex_u[3].rob_idx;
+  assign vpc_bm_o   = ex_u[3].br_mask & ~br_upd_i.resolve_mask;
+  assign vpc_eb_o   = (ex_u[3].raw[14:12] == 3'b000) ? 2'd0 : (ex_u[3].raw[14:12] == 3'b101) ? 2'd1 :
+                      (ex_u[3].raw[14:12] == 3'b110) ? 2'd2 : 2'd3;
+  assign vpc_we_o   = ex_u[3].raw[5];            // STORE-FP = 0100111，LOAD-FP = 0000111
   assign vec_inst_o = ex_u[3].raw;
+  assign vec_fast_o = ex_u[3].vfast;
   assign vec_a_o    = ex_a[3];
   assign vec_b_o    = ex_b[3];
   logic        vec_wait, vec_hold;
@@ -358,10 +376,11 @@ module o6_int_exu
   uop_t        vec_u;
   logic [63:0] vec_hd, vec_ht;
   logic        vec_hx;
+  logic        vec_hf;                    // 应答要求提交后冲刷 (P2.4a)
   logic [5:0]  vec_hc;
   logic        w6_take_vec;
   logic        vec_dir;                   // 应答那拍 W6 空：直接完成，不进 vec_hold
-  // 应答可以与请求同拍 (VU 当拍判定)：那时 vec_u 还没锁存，用 EX 级的 uop
+  // 应答可以与请求同拍 (VECU 当拍判定)：那时 vec_u 还没锁存，用 EX 级的 uop
   wire         vec_now = vec_rsp_i && (vec_wait || vec_req_o);
   uop_t        vec_uc;
   assign vec_uc = vec_wait ? vec_u : ex_u[3];
@@ -378,7 +397,7 @@ module o6_int_exu
   always_ff @(posedge clk_i) begin
     if (vec_req_o) vec_u <= ex_u[3];
     if (vec_now) begin
-      vec_hd <= vec_rdata_i; vec_hx <= vec_excp_i; vec_hc <= vec_cause_i; vec_ht <= vec_tval_i;
+      vec_hd <= vec_rdata_i; vec_hx <= vec_excp_i; vec_hc <= vec_cause_i; vec_ht <= vec_tval_i; vec_hf <= vec_flush_i;
     end
   end
 
@@ -413,7 +432,7 @@ module o6_int_exu
     fu_ok_o[3][FU_DIV] = !div_busy && !(rf_v[3] && rf_u[3].fu == FU_DIV) && !(ex_v[3] && ex_u[3].fu == FU_DIV);
     // CSR：上一条 CSR 结果还没写回时不发
     fu_ok_o[3][FU_CSR] = !csr_hold && !(rf_v[3] && rf_u[3].fu == FU_CSR) && !(ex_v[3] && ex_u[3].fu == FU_CSR) &&
-                         vu_idle_i;
+                         vecu_idle_i;
     // 向量：上一条还没完成 / 结果没写回时不发
     fu_ok_o[3][FU_VEC] = !vec_wait && !vec_hold && !(rf_v[3] && rf_u[3].fu == FU_VEC) && !(ex_v[3] && ex_u[3].fu == FU_VEC);
     // P4 / P5 (IQ_C)：纯 ALU
@@ -488,7 +507,8 @@ module o6_int_exu
       cmpl_p_o[p].cause       <= '0;
       cmpl_p_o[p].tval        <= '0;
       cmpl_p_o[p].flush_after <= 1'b0;
-      cmpl_p_o[p].replay      <= 1'b0;
+      // V5 快 vset：avl < VLMAX (vl 要变) 时 replay，重取后走原路径
+      cmpl_p_o[p].replay      <= !((p == 2 && mul_v) || (p == 3 && mul1_v)) && ex_u[p].fu == FU_ALU && ex_u[p].vsetf && (ex_a[p] < ex_imm[p]);
       cmpl_p_o[p].fflags      <= '0;
     end
   end
@@ -516,6 +536,7 @@ module o6_int_exu
   wire        vec_x = vec_dir ? vec_excp_i  : vec_hx;
   wire [5:0]  vec_c = vec_dir ? vec_cause_i : vec_hc;
   wire [63:0] vec_t = vec_dir ? vec_tval_i  : vec_ht;
+  wire        vec_f = vec_dir ? vec_flush_i : vec_hf;
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
@@ -543,7 +564,8 @@ module o6_int_exu
     cmpl_w6_o.excp        <= (w6_take_csr && !f2i_valid_i && !w6_take_div && csr_hx) || vx;
     cmpl_w6_o.cause       <= w6_take_csr ? csr_hc : vec_c;
     cmpl_w6_o.tval        <= w6_take_csr ? csr_ht : vec_t;
-    cmpl_w6_o.flush_after <= 1'b0;
+    // 向量单元应答要求提交后冲刷 (P2.4a：vsetvl 改了快路径条件 / 向量 store 与更年轻的 load 冲突)
+    cmpl_w6_o.flush_after <= w6_take_vec && !f2i_valid_i && !w6_take_div && !w6_take_csr && !vec_x && vec_f;
     cmpl_w6_o.replay      <= 1'b0;
     cmpl_w6_o.fflags      <= f2i_valid_i ? f2i_fflags_i : 5'd0;
   end

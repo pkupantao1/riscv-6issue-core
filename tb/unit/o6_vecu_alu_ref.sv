@@ -1,7 +1,7 @@
-// 参考模型：o6_vu_alu 重构 (合并加法器 / 比较 / 移位) 之前的原始写法 (每种操作各自的运算器)，只给 tb_vu_alu 锁步比对用
+// 参考模型：o6_vecu_alu 重构 (合并加法器 / 比较 / 移位) 之前的原始写法 (每种操作各自的运算器)，只给 tb_vecu_alu 锁步比对用
 
-module o6_vu_alu_ref
-  import o6_vu_pkg::*;
+module o6_vecu_alu_ref
+  import o6_vecu_pkg::*;
 #(
   parameter int W = 8
 ) (

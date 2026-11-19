@@ -65,7 +65,7 @@ CSR=1 bash $ROOT/scripts/run_rand.sh $s0 $NRAND 1500 > /dev/null
 echo "随机 CSR (种子 $s0..): $(grep -c '=== PASS' $ROOT/work/rand_csr${SOC:+_soc}/summary_csr_${s0}_${NRAND}.txt) / $NRAND" >> $R
 grep -v '=== PASS' $ROOT/work/rand_csr${SOC:+_soc}/summary_csr_${s0}_${NRAND}.txt >> $R
 
-# 分页 (Sv39 / 48 / 57、Svnapot、Svpbmt、指针掩码)、H (主体 HS / VS / VU / U)、H 两级翻译 (VS 页表 + G-stage)
+# 分页 (Sv39 / 48 / 57、Svnapot、Svpbmt、指针掩码)、H (主体 HS / VS / VECU / U)、H 两级翻译 (VS 页表 + G-stage)
 VM=1 bash $ROOT/scripts/run_rand.sh $s0 $NRAND 1500 > /dev/null
 echo "随机 VM (种子 $s0..): $(grep -c '=== PASS' $ROOT/work/rand_vm${SOC:+_soc}/summary_vm_${s0}_${NRAND}.txt) / $NRAND" >> $R
 grep -v '=== PASS' $ROOT/work/rand_vm${SOC:+_soc}/summary_vm_${s0}_${NRAND}.txt >> $R

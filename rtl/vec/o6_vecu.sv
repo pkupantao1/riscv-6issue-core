@@ -1,5 +1,5 @@
 //==============================================================================
-// o6_vu.sv - 向量单元 (RVV 1.0，VLEN = 1024)，与标量乱序核解耦、按序执行 (docs/11_vector_uarch.md)
+// o6_vecu.sv - 向量单元 (RVV 1.0，VLEN = 1024)，与标量乱序核解耦、按序执行 (docs/11_vector_uarch.md)
 //
 // 请求：ROB 头的 FU_VEC 指令由 P3 送来 (原始编码 + rs1 / rs2 值)，一次一条，直到回 rsp。
 //   异步指令 (纯向量运算)：合法性检查通过、队列有空即回完成，之后在后台按序执行。
@@ -14,9 +14,9 @@
 //==============================================================================
 `default_nettype none
 //------------------------------------------------------------------------------
-// o6_vu_pkg：向量单元与其子模块共用的类型 (放在同一个文件里，各流程的文件列表不用改)
+// o6_vecu_pkg：向量单元与其子模块共用的类型 (放在同一个文件里，各流程的文件列表不用改)
 //------------------------------------------------------------------------------
-package o6_vu_pkg;
+package o6_vecu_pkg;
   // 元素运算的操作码：a = vs2 元素，b = vs1 元素 / x[rs1] / 立即数，c = vd 旧值 (都已扩展到计算宽度)
   typedef enum logic [7:0] {
     A_ADD, A_SUB, A_RSUB, A_MINU, A_MIN, A_MAXU, A_MAX, A_AND, A_OR, A_XOR,
@@ -49,7 +49,7 @@ package o6_vu_pkg;
   } aop_e;
 endpackage
 
-module o6_vu
+module o6_vecu
   import o6_pkg::*;
   import o6_isa_pkg::*;
 #(
@@ -68,31 +68,144 @@ module o6_vu
   output logic                rsp_excp_o,
   output logic [5:0]          rsp_cause_o,
   output logic [63:0]         rsp_tval_o,
+  output logic                rsp_flush_o,      // 提交后冲刷 (P2.4a)：vsetvl 改了快路径条件 / 向量 store 与更年轻的 load 冲突
 
   // 访存口 (经 LSU，见 o6_lsu 的向量访存口)：每次一整行 64 B，请求保持到 done
   output logic                vm_req_o,         // 保持到 vm_ack (收下)；结果按序回 vm_done，最多 2 个在途
   input  wire                 vm_ack_i,
   output logic                vm_we_o,
-  output logic [63:0]         vm_va_o,          // 本次第一个活动字节的地址
-  output logic [511:0]        vm_wdata_o,       // 按行内字节位置
-  output logic [63:0]         vm_wmask_o,
+  output logic                vm_cont_o,        // 突发的后续行 (P2.3)：紧接上一行、同一页，LSU 不再翻译
+  output logic [63:0]         vm_va_o,          // 本次第 0 行的地址 (有活动字节时是第一个活动字节)
+  // P3 (docs/11 §7a)：合并方式一次最多连续 VM_NL 行 (同一页)，vm_ln 选访问哪几行
+  output logic [VM_NL-1:0]    vm_ln_o,
+  output logic [511:0]        vm_wdata_o [VM_NL],   // 各行，按行内字节位置
+  output logic [63:0]         vm_wmask_o [VM_NL],
   input  wire                 vm_done_i,
-  input  wire  [511:0]        vm_rdata_i,
-  input  wire                 vm_fault_i,
+  input  wire  [511:0]        vm_rdata_i [VM_NL],
+  input  wire                 vm_fault_i,       // vm_flane 那行起出错，之前的行已访存
+  input  wire  [1:0]          vm_flane_i,
   input  wire  [5:0]          vm_cause_i,
+  input  wire                 vm_conf_i,        // LSU：本拍写的向量 store 行与更年轻的 load 可能冲突 (P2.4a)
+  input  wire                 vm_tce_i,         // LSU：T / C 级都空，收下的行不会再报错 (P2.4b：向量 load 可提前应答)
 
   // 浮点：frm 在收指令时锁存 (随指令进队列)；异常标志在元素运算结果出来时随到随报 (CSR 里并入 fflags)
   input  wire  [2:0]          frm_i,
   output logic [4:0]          fflags_o,
 
   output logic                vs_dirty_o,       // 收下会改向量状态的指令：mstatus.VS 置 Dirty
-  output logic                idle_o            // 队列空、执行流水空、没有在处理的请求
+  output logic                idle_o,           // 队列空、执行流水空、没有在处理的请求
+
+  output logic                fast_ok_o,        // 当前 vtype 合法、LMUL <= 1、vstart = 0 (译码级分乱序候选用)
+  // O1 核内向量乱序 (docs/11 §9f)
+  output logic [10:0]         vl_o,             // 当前 vl / SEW / LMUL (译码级：乱序 uop 带上 vl / SEW；在途写的组大小)
+  output logic [1:0]          sew_o,
+  output logic [2:0]          lmul_o,
+  //   VX 流水：VIQ 发射来的乱序 uop (推测)。发射那拍读源 (按物理号，或 cr 的按 crat)，下一拍算、写 vprf[pd]、清忙、报完成；
+  //   误预测 (br_mask) / 冲刷作废
+  input  var br_update_t      br_upd_i,
+  input  wire                 flush_i,
+  //   V3：NVX 个执行器各一个发射口；整条发射 (组大小、源 0..2 的整组映射、v0、目的组)，vx_rdy_o[e] = 0 时执行器 e
+  //   的序列器还在逐拍送上一条。各自写回 (清忙) / 完成口
+  input  wire  [NVX-1:0]      vx_v_i,
+  input  wire  [31:0]         vx_raw_i [NVX],
+  input  wire  [1:0]          vx_sew_i [NVX],
+  input  wire  [10:0]         vx_vl_i  [NVX],
+  input  var vsrc_t           vx_v0_i  [NVX],
+  input  var rob_ptr_t        vx_rob_i [NVX],
+  input  var br_mask_t        vx_bm_i  [NVX],
+  input  wire  [3:0]          vx_ng_i  [NVX],
+  input  var vsrc_t [2:0][7:0] vx_sg_i [NVX],
+  input  var preg_t [7:0]     vx_pg_i  [NVX],
+  input  wire  [63:0]         vx_xs_i  [NVX],   // V1.2c：.vx / .vf 的标量 (x / f[rs1] 原值)
+  output logic [NVX-1:0]      vx_rdy_o,
+  input  wire  [3:0]          vx_ns_i  [NVX],   // V4：拍数 (源组寄存器数)
+  input  wire  [2:0]          vx_lm_i  [NVX],
+  input  wire                 vx_alt_i [NVX],
+  output logic [NVX-1:0]      vx_dok_o,         // V4：点积单元有空的 A 缓冲
+  output logic [NVX-1:0]      vxw_v_o,
+  output preg_t               vxw_p_o  [NVX],
+  output cmpl_t               vx_cmpl_o [NVX],
+  input  wire  [N_VPREG-1:0]  vbusy_i,          // V3：序列器逐拍查源 (链式：组里第 j 个还忙就停一拍)
+  //   M3b：向量 store 数据口 (vs_*)：读 src[2] (寄存器的当前值)，下一拍经 vsd_* 送 LSU 的 SQ 项 / ROB，不写 vprf、不报完成口
+  input  wire                 vs_v_i,
+  input  wire  [31:0]         vs_raw_i,
+  input  var vsrc_t [3:0]     vs_src_i,
+  input  var rob_ptr_t        vs_rob_i,
+  input  var br_mask_t        vs_bm_i,
+  input  var sq_ptr_t         vs_sq_i,
+  input  wire  [2:0]          vs_vk_i,          // M4a：store 数据 uop 是组里第几个寄存器
+  output logic [CL_B-1:0]     vsd_bm_o,         // M4a：写哪些字节 (带掩码时按 v0，否则全 1；寄存器字节序)
+  output logic                vsd_v_o,
+  output sq_ptr_t             vsd_sq_o,
+  output rob_ptr_t            vsd_rob_o,
+  output logic [CL_W-1:0]     vsd_d_o,
+  //   乱序 uop 提交时经提交口送来 "映射切换标记" (cv_mk，目的 = cv_pd，vd = 编码 [11:7])，与异步 load 一起按序进访存队列 lq，
+  //   再进改名 FIFO 按序切换 crat (同 I2b)；切换掉的旧物理寄存器按号码回池：核内池经 vfr 送回重命名的空闲表
+  input  wire                 cv_mk_i,
+  input  var preg_t           cv_pd_i,
+  input  wire  [4:0]          cv_vd_i,          // M3：切换标记的目的寄存器 (展开的向量 load 第 k 个 uop 是 vd + k)
+  input  wire  [3:0]          cv_ng_i,          // V1.2b：切换标记的组大小与整组新物理寄存器 (cv_pd_i = cv_pg_i[0])
+  input  var preg_t [7:0]     cv_pg_i,
+  output logic                vmok_o,           // M3：vtype 合法且 vstart = 0 (向量 load 可展开进共用 LSU)
+  output logic                valt_o,           // V1.2b：vtype.altfmt (= 1 时单宽度浮点运算非法，不进核内乱序)
+  output logic [9:0]          vt_o,             // V5：{vill, vtype[8:0]} (译码判快 vset)
+  //   M3：LSU 的向量 load 写口 (每条 load 流水一个)：vlw_bm 的字节写 vlw_d，vlw_ov 时其余字节写旧值 vlw_old
+  //   (按 crat 或物理号读)。目的 vlw_pd 是核内池里新分配的，与其它写口不冲突
+  input  wire  [N_LDP-1:0]    vlw_v_i,
+  input  var preg_t [N_LDP-1:0] vlw_pd_i,
+  input  wire  [CL_W-1:0]     vlw_d_i [N_LDP],
+  input  wire  [CL_B-1:0]     vlw_bm_i [N_LDP],
+  input  wire  [N_LDP-1:0]    vlw_ov_i,
+  input  var vsrc_t [N_LDP-1:0] vlw_old_i,
+  //   M4a：带掩码的 load (vlw_mk)：只写 vlw_bm 里 v0 对应位为 1 的字节 (v0 源 vlw_m0，第 vlw_k 个寄存器，元素宽度 2^vlw_eb 字节)
+  input  wire  [N_LDP-1:0]    vlw_mk_i,
+  input  var vsrc_t [N_LDP-1:0] vlw_m0_i,
+  input  wire  [2:0]          vlw_k_i [N_LDP],
+  input  wire  [1:0]          vlw_eb_i [N_LDP],
+  output logic [W-1:0]        vfr_v_o,          // V3：每拍至多回收 W 个 (原 2 个：m8 一条要还 8 个，4 个执行器时成了瓶颈)
+  output preg_t [W-1:0]       vfr_p_o,
+  //   已提交、还没做完的写向量寄存器的指令 (q / lq / 执行 / 访存引擎 / 改名在途) 写的寄存器 (组合，保守)
+  output logic [31:0]         vwpend_o,
+
+  // I1.3b 提交口 (docs/11 §9d)：纯向量运算不经 P3，在 ROB 头提交时由核的向量指令队列 (VDQ) 头送来。
+  //   cv_acc / cv_ill 只看 VDQ 头与 VECU 当前状态 (组合)；ROB 据 cv_acc 提交它，提交那拍 cv_go 入队
+  input  wire                 cv_v_i,
+  input  wire  [31:0]         cv_inst_i,
+  input  wire  [63:0]         cv_a_i,           // x[rs1] / f[rs1] (提交态，PRF 直读)
+  output logic                cv_acc_o,         // 合法且能入队
+  output logic                cv_ill_o,         // 非法 (核报非法指令异常)
+  input  wire                 cv_go_i,
+  // V5 每拍提交至多 NVC 条：VDQ 第 1..NVC-1 项是切换标记 (cvx_v) 时可与头同拍提交 (cvx_acc：头及之前的都收下时它也能收)；
+  //   cv_gon：本拍提交的条数 (头 + 跟着的标记)
+  input  wire  [NVC-1:1]      cvx_v_i,
+  input  wire  [31:0]         cvx_inst_i [NVC],
+  input  var preg_t           cvx_pd_i   [NVC],
+  input  wire  [4:0]          cvx_vd_i   [NVC],
+  input  wire  [3:0]          cvx_ng_i   [NVC],
+  input  var preg_t [7:0]     cvx_pg_i   [NVC],
+  output logic [NVC-1:1]      cvx_acc_o,
+  input  wire  [2:0]          cv_gon_i,
+  // I2a (docs/11 §9e)：提交口也收预查过的单位步长类向量 load (vel)，进访存队列 lq，提交后异步访存。
+  //   cv_sqb：它分派时的 SQ 尾 (之前的 store 比它老)。vm_async / vm_sqb：访存引擎当前这条是异步 load 及其界 (LSU 据此
+  //   只等比它老的 store 排空)；vbar：最老的未做完的异步 load 的界 (LSU 不排空 SQ 头在界上的更年轻 store)；
+  //   vasync：有未做完的异步 load (核这期间不陷入：它按提交时的上下文访存)
+  input  var sq_ptr_t         cv_sqb_i,
+  output logic                vm_async_o,
+  output sq_ptr_t             vm_sqb_o,
+  output logic                vbar_v_o,
+  output sq_ptr_t             vbar_o,
+  output logic                vasync_o
 );
   localparam int LVLEN = $clog2(VLEN);          // 10
   localparam int LDLEN = $clog2(DLEN);
   localparam int VLW   = LVLEN + 1;             // vl 0..1024
   localparam int NEB   = DLEN / 8;              // 每拍最多元素数 (SEW = 8)
-  localparam int QD    = 8;                     // 指令队列深度
+  // 指令队列深度。I2c：8 -> 16，提交可以跑到执行前面更远 (下一遍的 vle 更早提交、更早开始)
+`ifdef O6_VQD
+  localparam int QD    = `O6_VQD;
+`else
+  localparam int QD    = 16;
+`endif
 
   //==========================================================================
   // 向量 CSR
@@ -131,8 +244,14 @@ module o6_vu
   //==========================================================================
   // 向量寄存器堆 (32 x VLEN，触发器)
   //==========================================================================
-  logic [VLEN-1:0] vrf [32];
-  logic [2:0]      rrm;                         // 请求的 frm (当拍的请求 / 锁存的；合法性要用，定义见请求处理)
+  // 向量物理寄存器堆 VPRF (N_VPREG x VLEN，docs/11 §3) + 提交态映射 crat (架构号 -> 物理号)。
+  // I1.1：crat 恒为恒等映射 (物理 0..31)，行为与原 32 项寄存器堆逐拍相同；vrf 是按 crat 读出的架构视图 (只读)
+  logic [VLEN-1:0]   vprf [N_VPREG];
+  logic [PREG_W-1:0] crat [32];
+  logic [VLEN-1:0]   vrf  [32];
+  for (genvar r = 0; r < 32; r++) begin : g_vrf_view assign vrf[r] = vprf[crat[r]]; end   // 连续赋值 (always_comb 对大数组变下标读的敏感表在 VCS 里不可靠)
+  // crat 的更新 (快路径执行时改映射) 在请求处理之后
+  logic [2:0]      rrm;                     // 请求的 frm (当拍的请求 / 锁存的；合法性要用，定义见请求处理)
 
   //==========================================================================
   // 指令分类 (按原始编码)
@@ -161,8 +280,8 @@ module o6_vu
     K_DOT         // 点积 vd[0] += vs1 . vs2 (OP-VE)          (异步)
   } kind_e;
 
-  // 元素运算的操作码 aop_e 定义在本文件开头的 o6_vu_pkg (子模块 o6_vu_alu 也要用)
-  import o6_vu_pkg::*;
+  // 元素运算的操作码 aop_e 定义在本文件开头的 o6_vecu_pkg (子模块 o6_vecu_alu 也要用)
+  import o6_vecu_pkg::*;
 
   // 宽度类 (相对 SEW)：0 同宽 SSS，1 加宽 .vv/.vx (DSS)，2 加宽 .wv/.wx (DDS)，3 收窄 (SDS)
   typedef struct packed {
@@ -540,7 +659,7 @@ module o6_vu
   endfunction
 
   // 按当前 vtype 的合法性 (Spike 的 require_vector / VI_CHECK_*)
-  function automatic logic vlegal(input vdec_t d);
+  function automatic logic vlegal(input vdec_t d, input logic [2:0] frm);   // frm：本条的动态舍入模式 (I1.3b 提交口另有一份)
     int  ll;
     logic ok, v1;
     ll = lmul_log2(lmul);
@@ -647,7 +766,7 @@ module o6_vu
       default: ok = 1'b0;
     endcase
     // 浮点 (VI_VFP_COMMON 及各转换的 CHECK)：SEW 受限、frm 必须合法 (validate_rm)
-    if (d.fp && (!d.sewm[sew] || rrm > 3'd4)) ok = 1'b0;
+    if (d.fp && (!d.sewm[sew] || frm > 3'd4)) ok = 1'b0;
     // altfmt：浮点指令只有少数在 altfmt = 1 时合法 (BF16 / OFP8 转换、vfwmaccbf16、部分整数 <-> 浮点转换、点积)
     if (d.fp && altf && !d.afm[sew]) ok = 1'b0;
     if (d.afreq && !altf) ok = 1'b0;
@@ -755,14 +874,81 @@ module o6_vu
   logic [$clog2(QD)-1:0] q_h, q_t;
   logic [$clog2(QD):0]   q_n;
 
+  // I2a 访存队列 (提交口收下的异步 load，docs/11 §9e)：{编码, x[rs1], SQ 界, 比它老的还在指令队列 q 里的条数}。
+  //   qold 在 q 每出一条 (x_start) 时减一；队头 qold = 0 时 q 里剩下的都比它年轻
+  //   O1：乱序 uop 的切换标记也按序进 lq (lq_mk，目的物理寄存器 lq_pd)，到队头就进改名 FIFO (不经访存引擎)。4 -> 8 项
+  localparam int LQD = 16;                    // V5：8 -> 16 (每拍至多进 NVC 个切换标记)
+  localparam int LQW = $clog2(LQD);
+  logic [31:0]           lq_inst [LQD];
+  logic [63:0]           lq_a    [LQD];
+  sq_ptr_t               lq_sqb  [LQD];
+  logic [$clog2(QD):0]   lq_qold [LQD];
+  logic                  lq_mk   [LQD];
+  logic [2:0]            mf_n;      // V5：本拍走快路径直接切换的 lq 头标记数 (逻辑见改名)
+  preg_t                 lq_pd   [LQD];
+  logic [4:0]            lq_vd   [LQD];      // M3：切换标记的目的寄存器
+  logic [3:0]            lq_ng   [LQD];      // V1.2b：切换标记的组大小与整组新物理寄存器
+  preg_t [7:0]           lq_pg   [LQD];
+  logic [LQW-1:0]        lq_h, lq_t;
+  logic [LQW:0]          lq_n;
+  wire                   lq_full = (lq_n == (LQW+1)'(LQD));
+  wire                   lq_hold = (lq_n != '0) && (lq_qold[lq_h] == '0);   // 队头的异步 load 已不比 q 头年轻
+  // 访存引擎当前这条的指令 (同步请求的 / 访存队列头的，开始时锁存)；m_on：引擎在做 (原 rs == R_MEM)；m_as：这条是异步 load
+  logic [31:0] me_i;
+  logic [63:0] me_a, me_b;
+  sq_ptr_t     me_sqb;
+  logic        m_on, m_as;
+  logic [31:0] me_rset;          // 这条读写的寄存器 (开始时锁存；更年轻的指令在它做完前与之不相交才放行)
+  logic        ma_go;            // 访存队列头开始 (逻辑见访存引擎)
+  logic        mk_go;            // O1：访存队列头的切换标记进改名 FIFO (逻辑见改名)
+  // I2b 向量寄存器重命名 (docs/11 §9e)：不带掩码的异步 load 开始时给目的组分新的物理寄存器 (VECU 内的空闲 FIFO)，
+  //   不等比它老的运算读完 / 写完它的目的。e_qold：引擎里这条 load 开始时 q 里比它老的条数 (随 q 出队递减)，
+  //   > 0 时 q 头比它老，不受它的计分板约束 (老的照旧按 crat 读写旧的物理寄存器)。
+  //   I2c：在途的改名最多 RNQ 个 (按程序序的 FIFO rq_*，头先切换)，引擎做完一条就可开始下一条，不等上一条切换
+`ifdef O6_NO_VRN
+  localparam bit RN_EN = 1'b0;
+`else
+  localparam bit RN_EN = VEL;
+`endif
+  localparam int RNQ = 4;              // O1：2 -> 4 (乱序 uop 的切换标记也占)
+  localparam int RQW = $clog2(RNQ);
+  logic [$clog2(QD):0] e_qold;
+  logic                m_rn;               // 引擎当前这条 load 改了名 (写 rq 的 e_ri 项)
+  logic [RQW-1:0]      e_ri;
+  logic [RNQ-1:0]      rq_v;               // 各项有效 (改名在途：目的写新的物理寄存器，crat 还是旧的)
+  logic [RQW-1:0]      rq_h, rq_t;         // FIFO 头 (下一个切换的) / 尾 (下一个分配的)
+  logic [4:0]          rq_vd   [RNQ];      // 目的组首寄存器
+  logic [3:0]          rq_nn   [RNQ];      // 组大小 (1..8)
+  preg_t               rq_p    [RNQ][8];   // 新的物理寄存器
+  logic [31:0]         rq_grp  [RNQ];      // 目的组 (架构号位图)
+  logic [$clog2(QD):0] rq_qold [RNQ];      // q 里比这条 load 老的条数
+  logic                rq_mk   [RNQ];      // O1：乱序 uop 的切换标记 (数据已在新的物理寄存器里，切换时不补字节、不算在途写)
+  logic                rn_sw;              // 本拍切换头项的映射 (见改名一节)
+  wire                 rn_any = (rq_v != '0);
+  // VECU 池的空闲 FIFO (O1：只管 [VCP, N_VPREG) 这 VNP 个；核内池的由重命名分配、经 vfr 回收)
+  localparam int NFR = VNP;
+  localparam int FRW = $clog2(NFR);
+  preg_t             fr_q [NFR];
+  logic [FRW-1:0]    fr_h, fr_t;
+  logic [FRW:0]      fr_n;
+  // O1 在途写 (vwpend_o) 用：q / lq 各项写的寄存器 (入队时按当时的 vtype 算)、S3 那拍所属指令的写集合
+  logic [31:0]       q_ws  [QD];
+  logic [31:0]       lq_ws [LQD];
+  logic [31:0]       s3_wm;
   // 访存引擎状态 (逻辑在后面)
   logic        m_fin, m_flt;
+  logic        m_conf;           // 本条向量 store 写的行与更年轻的 load 可能冲突 (LSU vm_conf 累积，P2.4a)
+  logic        m_trim;           // fault-only-first：截短 vl (逻辑在访存引擎)
+  // P2.4b 异步 load：所有行都发出且过了 LSU 的 T / C (不会再出错) 就应答 (m_early)，VECU 回空闲；
+  //   剩下的行回来照常写寄存器堆 (m_tail 期间)。m_pw = 这条 load 要写的寄存器 (计分板)，m_ld = 它是 load (锁存，rq 会被新请求换掉)
+  logic        m_early, m_tail, m_ld;
+  logic [31:0] m_pw;
   logic [5:0]  m_cause;
   logic [63:0] m_tval;
   // 执行
   logic        x_busy;
   logic        s2_v, s3_v;       // 拍流水 S2 (计算) / S3 (写回) 有效 (见执行流水)
-  localparam int ANP = 4;        // S2 之后的运算流水级数 (= 元素运算槽 o6_vu_alu 的流水级数，>= 4)
+  localparam int ANP = 4;        // S2 之后的运算流水级数 (= 元素运算槽 o6_vecu_alu 的流水级数，>= 4)
   logic [ANP-1:0] s2p_v;         // 运算流水各级有效 (S2 -> P1 .. P<ANP> -> S3)
   // 写回上下文：运算流水 / S3 里的拍可能属于已经离开 S1、S2 的前一条指令 (计分板放行后新指令在执行)，
   //   写回要用的指令信息随拍走，不再看在执行的 xd / xcw / xdw
@@ -774,8 +960,26 @@ module o6_vu
   } wc_t;
   wc_t         p_wc [ANP];
   logic [31:0] p_wr;              // 运算流水里各拍要写的寄存器之并 (计分板)
-  wire         drained = (q_n == '0) && !x_busy && !s2_v && (s2p_v == '0) && !s3_v;
-  assign idle_o = drained && (rs == R_IDLE);
+  // I1.3a 浮点快车道的槽 (说明见计分板)
+  localparam int NSL = 16;                         // 槽数 (> ADDMUL 延迟，满了停发)
+  localparam int SLW = $clog2(NSL);
+  typedef struct packed {
+    logic [4:0] r;                                 // 目的 (架构号，写时经 crat)
+    logic [3:0] blk;                               // 寄存器内的 DLEN 块号
+    logic [1:0] dw;
+  } fsl_t;
+  fsl_t            sl   [NSL];
+  logic [NSL-1:0]  sl_v;
+  logic [SLW-1:0]  sl_h;                           // 下一个分配的槽
+  logic            x_ff;                           // 在执行的指令走快车道
+  logic            x_ffend;                        // 本拍快车道指令最后一拍发完 (可背靠背开始下一条)
+  logic [31:0]     ff_wr;                          // 快车道在途写的寄存器
+  // I1.3c：向量访存不等全部排空，只等队列空、执行流水发完、且在途的写与它读写的寄存器不相交 (见访存引擎)
+  logic            mem_ok;
+  wire         drained = (q_n == '0) && !x_busy && !s2_v && (s2p_v == '0) && !s3_v && !m_tail &&   // 含异步 load 的写回 (P2.4b)
+                         (sl_v == '0) &&                                                           // 含快车道在途 (I1.3a)
+                         (lq_n == '0) && !m_on && !rn_any;                                         // 含提交后的异步 load 与改名 (I2)
+  assign idle_o = drained && (rs == R_IDLE) && !cv_go_i;      // 提交口入队那拍队列还空，不算空闲 (I1.3b)
 
   // CSR 访问
   logic [11:0] ca;
@@ -896,10 +1100,10 @@ module o6_vu
   end
 
   wire q_full = (q_n == ($clog2(QD)+1)'(QD));
-  wire async_k = (rd_.k == K_EW) || (rd_.k == K_EWM) || (rd_.k == K_VMVSX) || (rd_.k == K_RED) ||
-                 (rd_.k == K_MLOG) || (rd_.k == K_MSET) || (rd_.k == K_VIOTA) || (rd_.k == K_PERM) ||
-                 (rd_.k == K_VMVNR) || (rd_.k == K_FEW) || (rd_.k == K_FEWM) || (rd_.k == K_FRED) ||
-                 (rd_.k == K_DOT);
+  wire async_k = ((rd_.k == K_EW) || (rd_.k == K_EWM) || (rd_.k == K_VMVSX) || (rd_.k == K_RED) ||
+                  (rd_.k == K_MLOG) || (rd_.k == K_MSET) || (rd_.k == K_VIOTA) || (rd_.k == K_PERM) ||
+                  (rd_.k == K_VMVNR) || (rd_.k == K_FEW) || (rd_.k == K_FEWM) || (rd_.k == K_FRED) ||
+                  (rd_.k == K_DOT));
   // 本拍完成 (R_DEC：非法 / 异步入队；R_SYNC：排空后执行)
   logic do_rsp, do_enq, do_sync;
   always_comb begin
@@ -909,16 +1113,77 @@ module o6_vu
       else if (async_k) begin if (!q_full) begin do_rsp = 1'b1; do_enq = 1'b1; end end
     end else if (rs == R_SYNC && drained && rq.k != K_VMEM && (!sy_k || sy_ph == 2'd2)) begin
       do_rsp = 1'b1; do_sync = 1'b1;
-    end else if (rs == R_MEM && m_fin) begin
+    end else if (rs == R_MEM && (m_fin || m_early)) begin
       do_rsp = 1'b1;
     end
   end
+
+  //--------------------------------------------------------------------------
+  // I1.3b 提交口：VDQ 头的合法性按当前 vtype 判 (到 ROB 头时比它老的 vsetvl 都已执行)，frm 取当前值
+  //   (比它老的 CSR 写都已提交；比它新的要等 VECU 空闲才执行)。只在请求口空闲时收 (ROB 头的向量指令只有一条)
+  //--------------------------------------------------------------------------
+  function automatic logic asyk(input vdec_t d);
+    return (d.k == K_EW) || (d.k == K_EWM) || (d.k == K_VMVSX) || (d.k == K_RED) ||
+           (d.k == K_MLOG) || (d.k == K_MSET) || (d.k == K_VIOTA) || (d.k == K_PERM) ||
+           (d.k == K_VMVNR) || (d.k == K_FEW) || (d.k == K_FEWM) || (d.k == K_FRED) || (d.k == K_DOT);
+  endfunction
+  vdec_t       cvd;
+  logic        cv_lg, cv_ld;
+  logic [63:0] cv_ax;              // 进队列的标量操作数 (浮点按 SEW 拆盒，同 ra_x)
+  always_comb begin
+    logic vsw;
+    cvd   = vdec(cv_inst_i);
+    // I2a：单位步长类向量 load (译码级按 vel_op 分出来的) 进访存队列，合法性同请求口 (vmlegal，按当前 vtype)
+    cv_ld = VEL && (cvd.k == K_VMEM) && !cvd.st &&
+            (cvd.mm == M_UNIT || cvd.mm == M_WHOLE || cvd.mm == M_MASK || cvd.mm == M_FF);
+    cv_lg = cv_mk_i ? 1'b1 :                         // O1 乱序 uop 的切换标记 (已执行完，合法性译码时就定了)
+            cv_ld ? vmlegal(cvd) :
+            ((cvd.k != K_VMEM) && (cvd.k != K_CSR) && (cvd.k != K_VSET) && vlegal(cvd, frm_i) && asyk(cvd));
+    // vstart != 0 (陷入返回后重做的 load) 时：这条 load 要等之前的异步 load 都做完再收，之后的指令要等它做完 (vstart 清零) 再判合法
+    vsw   = (vstart != '0) && ((lq_n != '0) || m_on) && !cv_mk_i;
+    cv_acc_o = cv_v_i && (rs == R_IDLE) && !req_v_i && cv_lg && ((cv_ld || cv_mk_i) ? !lq_full : !q_full) && !vsw;
+    cv_ill_o = cv_v_i && (rs == R_IDLE) && !req_v_i && !cv_lg && !vsw;
+    // V5：跟在头后面的切换标记，lq 放得下就同拍收 (头进 q 时它们的 qold 多算头那一条)
+    begin
+      logic a;
+      int   n;
+      a = cv_acc_o;
+      n = int'(lq_n) + ((cv_ld || cv_mk_i) ? 1 : 0);
+      for (int k = 1; k < NVC; k++) begin
+        n = n + 1;
+        a = a && cvx_v_i[k] && (n <= LQD);
+        cvx_acc_o[k] = a;
+      end
+    end
+    cv_ax = cv_a_i;
+    if (cvd.fp && cvd.src == 2'd1)
+      unique case (sew)
+        2'd1: cv_ax = (&cv_a_i[63:16]) ? {48'b0, cv_a_i[15:0]} : (cvd.bf ? 64'h7FC0 : 64'h7E00);
+        2'd2: cv_ax = (&cv_a_i[63:32]) ? {32'b0, cv_a_i[31:0]} : 64'h7FC0_0000;
+        default: ;
+      endcase
+  end
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i)
+    if (rst_ni) begin
+      assert (!cv_go_i || cv_acc_o) else $error("vecu: 提交口入队时不可收");
+      assert (!(cv_go_i && (do_enq || req_v_i))) else $error("vecu: 提交口与请求口同拍");
+    end
+`endif
 
   always_comb begin
     rsp_v_o     = do_rsp;
     rsp_excp_o  = ((rs == R_DEC || r_new) && (!rlegal || (rd_.k == K_CSR && cill))) || (rs == R_MEM && m_flt);
     rsp_cause_o = (rs == R_MEM) ? m_cause : EXC_ILLEGAL_INST;
     rsp_tval_o  = (rs == R_MEM) ? m_tval : {32'b0, ri};
+    // P2.4a：vsetvl 只在快路径条件 (!vill && LMUL <= 1 && vstart = 0，执行后 vstart = 0) 变了时冲刷；
+    //   向量 store 只在写的行与更年轻的 load 可能冲突 (m_conf) 时冲刷
+    //   O1：乱序 uop 带着译码时的 vl / SEW、在途写的组大小按译码时的 LMUL 算 -> vsetvl 改了 vl / vtype 就冲刷；
+    //   fault-only-first 截了 vl 也冲刷
+    rsp_flush_o = (rs == R_SYNC && rq.k == K_VSET && (!vs_n.vill && (vs_n.vt[2:0] == 3'b000 || vs_n.vt[2])) != fast_ok_o) ||
+                  (VOOO && rs == R_SYNC && rq.k == K_VSET && (vs_n.vl != vl || vs_n.vt != vt || vs_n.vill != vill)) ||
+                  (VOOO && rs == R_MEM && m_trim) ||
+                  (rs == R_MEM && rq.st && m_conf);
     unique case (rq.k)                                  // 只有同步执行的应答带数据 (空闲当拍应答的是非法 / 异步)
       K_VSET:  rsp_data_o = 64'(vs_n.vl);
       K_CSR:   rsp_data_o = crv;
@@ -930,7 +1195,8 @@ module o6_vu
     endcase
     // VS 变脏：收下 (不含只读的 CSR 访问)
     // 访存无论成败都会写 vstart (Spike 出错时写出错元素号)，同样置脏
-    vs_dirty_o = do_rsp && ((rs == R_MEM) || (!rsp_excp_o && !(rs == R_SYNC && rq.k == K_CSR && !cwr)));
+    vs_dirty_o = (do_rsp && ((rs == R_MEM) || (!rsp_excp_o && !(rs == R_SYNC && rq.k == K_CSR && !cwr)))) ||
+                 cv_go_i;                                   // 提交口入队 (I1.3b)
   end
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
@@ -945,8 +1211,8 @@ module o6_vu
           if (do_rsp)                                     rs <= R_IDLE;
           else if (rlegal && !async_k && !(rd_.k == K_CSR && cill)) rs <= R_SYNC;
         end
-        R_SYNC: if (drained && (!sy_k || sy_ph == 2'd2)) rs <= (rq.k == K_VMEM) ? R_MEM : R_IDLE;
-        R_MEM:  if (m_fin) rs <= R_IDLE;
+        R_SYNC: if ((rq.k == K_VMEM) ? mem_ok : (drained && (!sy_k || sy_ph == 2'd2))) rs <= (rq.k == K_VMEM) ? R_MEM : R_IDLE;
+        R_MEM:  if (m_fin || m_early) rs <= R_IDLE;
         default: rs <= R_IDLE;
       endcase
     end
@@ -955,6 +1221,22 @@ module o6_vu
     if (r_new) begin ri_q <= req_inst_i; ra_q <= req_a_i; rb_q <= req_b_i; rrm_q <= frm_i; end
   end
   assign rq = vdec(ri_q);
+
+  assign fast_ok_o = !vill && (lmul == 3'b000 || lmul[2]) && (vstart == '0);
+  assign vmok_o    = !vill && (vstart == '0);
+  assign valt_o    = altf;
+  assign vt_o      = {vill, vt};
+  assign vl_o = vl; assign sew_o = sew; assign lmul_o = lmul;
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni)    for (int r = 0; r < 32; r++) crat[r] <= PREG_W'(r);
+    else if (rn_sw) begin
+      for (int k = 0; k < 8; k++) if (k < int'(rq_nn[rq_h])) crat[rq_vd[rq_h] + 5'(k)] <= rq_p[rq_h][k];   // I2b / O1 切换
+    end else if (mf_n != '0) begin                                             // V5 快路径：lq 头的标记按序切换
+      for (int j = 0; j < NVC; j++)
+        if (3'(j) < mf_n)
+          for (int k = 0; k < 8; k++)
+            if (k < int'(lq_ng[LQW'(lq_h + LQW'(j))])) crat[lq_vd[LQW'(lq_h + LQW'(j))] + 5'(k)] <= lq_pg[LQW'(lq_h + LQW'(j))][k];
+    end
   always_comb begin
     rd_ = vdec(ri);
     unique case (rd_.k)
@@ -963,7 +1245,7 @@ module o6_vu
       K_VMVXS: rlegal = !vill && (vstart == '0);
       K_VFMVFS: rlegal = !vill && rd_.sewm[sew] && (rrm <= 3'd4);     // VI_VFP_COMMON (不查 vstart)
       K_VMEM:  rlegal = vmlegal(rd_);
-      default: rlegal = vlegal(rd_);
+      default: rlegal = vlegal(rd_, rrm);
     endcase
   end
 
@@ -1042,44 +1324,127 @@ module o6_vu
   endfunction
   function automatic logic [31:0] xrds(input vdec_t d, input xp_t p);       // 读集合
     logic [31:0] m;
+    logic sc;
     if (d.k == K_VMVNR) return rgm(d.vs2, int'(d.vs1) + 1);
-    m = rgm(d.vs2, (d.k == K_VIOTA) ? 1 : rspan(p.s2w)) | rgm(d.vd, rspan(p.dw));   // vd：乘加读旧值
-    if (d.src == 2'd0) m = m | rgm(d.vs1, rspan(sew));
+    // 点积 / 归约只读写 vd 的元素 0 (一个寄存器)；归约的 vs1 也只读元素 0。原来按 "目的宽度 × LMUL" 估成整组 (至多 8 个)，
+    //   连续几条点积 (vd 相邻) 被误判为相关，每条要等上一条走完运算流水 (fp8dot 每条 31 拍里约 14 拍空泡)
+    sc = (d.k == K_DOT) || (d.k == K_RED) || (d.k == K_FRED);
+    m = rgm(d.vs2, (d.k == K_VIOTA) ? 1 : rspan(p.s2w)) | rgm(d.vd, sc ? 1 : rspan(p.dw));   // vd：乘加读旧值
+    if (d.src == 2'd0) m = m | rgm(d.vs1, (d.k == K_RED || d.k == K_FRED) ? 1 : rspan(sew));
     if (!d.vm || d.cin) m[0] = 1'b1;                                        // v0：掩码 / 进位
     return m;
   endfunction
   function automatic logic [31:0] xwrs(input vdec_t d, input xp_t p);       // 写集合
-    return (d.k == K_VMVNR) ? rgm(d.vd, int'(d.vs1) + 1) : rgm(d.vd, rspan(p.dw));
+    return (d.k == K_VMVNR) ? rgm(d.vd, int'(d.vs1) + 1) :
+           (d.k == K_DOT || d.k == K_RED || d.k == K_FRED) ? rgm(d.vd, 1) : rgm(d.vd, rspan(p.dw));
   endfunction
   vdec_t       qd;
   xp_t         qp;
-  logic        q_s2k;
+  logic        q_s2k, q_ffk;
   logic [31:0] x_wm;             // 在执行的指令的写集合 (进运算流水时随拍带上)
+  logic [31:0] x_rd;             // 在执行的指令的读集合 (I2b：改名切换要等更老的读完)
+
+  //--------------------------------------------------------------------------
+  // I1.3a 浮点快车道 (docs/11 §9c)：单宽度 ADDMUL 类 (vfadd / vfsub / vfrsub / vfmul / 8 种乘加)，SEW = 16 / 32 / 64。
+  //   fpnew 主实例的 ADDMUL 组全流水、延迟固定，各通道同拍发出的元素同拍回来。快车道的拍发出后不进结果缓冲：
+  //   每个发射拍 (有元素发出的) 占一个槽 {目的寄存器, 块号, 宽度}，标签带槽号，结果回来那拍按槽经 E 口直接写寄存器堆。
+  //   于是上一条最后一拍发出即可开始下一条 (背靠背)，不等结果。计分板 ff_wr = 在途槽的目的寄存器之并。
+  //   其余浮点 (比较、最值、转换、除 / 开方、加宽、归约) 仍走原路径 (按拍收齐再写)，开始前要快车道排空。
+  //--------------------------------------------------------------------------
+  // 调试 / 消融开关 (I1.3)：O6_NO_FF 关快车道，O6_NO_FFB 关副实例 B，O6_NO_FFPRE 关预读，O6_NO_MEMSB 访存回到全部排空
+`ifdef O6_NO_FF
+  localparam bit FF_EN = 1'b0;
+`else
+  localparam bit FF_EN = 1'b1;
+`endif
+  function automatic logic ffk(input vdec_t d, input logic [1:0] s);
+    return FF_EN && d.k == K_FEW && d.wcls == 2'd0 && s != 2'd0 &&
+           (d.op == F_ADD || d.op == F_SUB || d.op == F_RSUB || d.op == F_MUL ||
+            d.op == F_MACC || d.op == F_NMACC || d.op == F_MSAC || d.op == F_NMSAC ||
+            d.op == F_MADD || d.op == F_NMADD || d.op == F_MSUB || d.op == F_NMSUB);
+  endfunction
+  //   (槽与 ff_wr 的声明在 drained 之前)
+  wire             ff_full = sl_v[sl_h];
   always_comb begin
+    ff_wr = '0;
+    for (int k = 0; k < NSL; k++) if (sl_v[k]) ff_wr = ff_wr | (32'(1) << sl[k].r);
+  end
+
+  logic [31:0] q_rw;             // q 头的读写集合
+  logic        rq_blk;           // q 头要等某个在途改名切换 (I2b)
+  always_comb begin
+    logic [31:0] rds, hz;
+    logic        yng;
     qd = vdec(qi);
     qp = xparam(qd);
     q_s2k = (qd.k == K_EW) || (qd.k == K_EWM) || (qd.k == K_VIOTA) || (qd.k == K_VMVNR) ||
             (qd.k == K_RED) || (qd.k == K_DOT);
-    x_start = !x_busy && (q_n != '0) && !s2_v &&
-              ((s2p_v == '0) || (q_s2k && (xrds(qd, qp) & p_wr) == '0));
+    q_ffk = ffk(qd, sew);
+    rds = xrds(qd, qp);                                     // 读集合含 vd (乘加读旧值；写集合 ⊆ 读集合)
+    q_rw = rds | xwrs(qd, qp);
+    hz  = ff_wr | ((x_busy && x_ff) ? x_wm : '0);           // 快车道在途 + 正在发最后一拍的那条
+    yng = (e_qold == '0);                                   // q 头比引擎里 (在做 / 写回) 的 load 年轻 (I2b)
+    rq_blk = 1'b0;
+    for (int j = 0; j < RNQ; j++)
+      if (rq_v[j] && rq_qold[j] == '0 && (q_rw & rq_grp[j]) != '0) rq_blk = 1'b1;
+    x_start = (!x_busy || x_ffend) && (q_n != '0) && !s2_v &&
+              (q_s2k ? ((rds & (p_wr | hz)) == '0) :
+               q_ffk ? ((rds & (p_wr | hz)) == '0) :
+                       (!x_busy && (s2p_v == '0) && (sl_v == '0))) &&
+              // 异步 load 写回期间 (P2.4b)：只放行走 S2 / 快车道的、读写集合与 load 的目的不相交的指令
+              (!m_tail || !yng || ((q_s2k || q_ffk) && (q_rw & m_pw) == '0)) &&
+              // I2a：q 头比还没开始的异步 load 年轻时等它开始；访存引擎在做时同上，与它读写的寄存器不相交才放行
+              !lq_hold &&
+              (!m_on || !yng || ((q_s2k || q_ffk) && (q_rw & me_rset) == '0)) &&
+              // I2b：改名在途 (映射还没切) 时，比那条 load 年轻 (它的 qold = 0) 且碰到它目的组的指令等它切换
+              !rq_blk;
   end
 
+  wire cv_q  = cv_go_i && !cv_ld && !cv_mk_i;             // 提交口收下的进指令队列 q / 访存队列 lq (I2a；O1 切换标记也进 lq)
+  wire cv_lq = cv_go_i && (cv_ld || cv_mk_i);
+  wire [2:0] cvx_n  = (cv_gon_i > 3'd1) ? cv_gon_i - 3'd1 : 3'd0;   // V5：跟着头一起提交的标记数 (都进 lq)
+  wire [2:0] lq_npop = (ma_go || mk_go) ? 3'd1 : mf_n;
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
       x_busy <= 1'b0; q_h <= '0; q_t <= '0; q_n <= '0;
+      lq_h <= '0; lq_t <= '0; lq_n <= '0;
     end else begin
-      if (do_enq) q_t <= q_t + 1'b1;
+      if (do_enq || cv_q) q_t <= q_t + 1'b1;                  // 请求口 / 提交口 (I1.3b) 不同拍
       if (x_start) q_h <= q_h + 1'b1;
-      q_n <= q_n + do_enq - x_start;
+      q_n <= q_n + (do_enq || cv_q) - x_start;
+      lq_t <= lq_t + LQW'(cv_lq) + LQW'(cvx_n);
+      lq_h <= lq_h + LQW'(lq_npop);
+      lq_n <= lq_n + (LQW+1)'(cv_lq) + (LQW+1)'(cvx_n) - (LQW+1)'(lq_npop);
       if (x_start) begin
         xp_t p;
         p = xparam(vdec(qi));
         x_busy <= (p.nb != '0);
       end else if (x_busy && x_bdone && xb + 1'b1 >= xnb) x_busy <= 1'b0;
+      else if (x_ffend) x_busy <= 1'b0;                  // 快车道：最后一拍发完即空出 (结果经槽写回)
     end
   end
   always_ff @(posedge clk_i) begin
-    if (do_enq) begin q_inst[q_t] <= ri; q_a[q_t] <= ra_x; q_rm[q_t] <= rrm; end
+    if (do_enq) begin q_inst[q_t] <= ri; q_a[q_t] <= ra_x; q_rm[q_t] <= rrm; q_ws[q_t] <= xwrs(rd_, xparam(rd_)); end
+    else if (cv_q) begin q_inst[q_t] <= cv_inst_i; q_a[q_t] <= cv_ax; q_rm[q_t] <= frm_i; q_ws[q_t] <= xwrs(cvd, xparam(cvd)); end
+    // 访存队列：新项的 qold = q 里本拍之后还剩的条数 (都比它老)；各项随 q 出队递减
+    for (int k = 0; k < LQD; k++)
+      if (x_start && lq_qold[k] != '0) lq_qold[k] <= lq_qold[k] - 1'b1;
+    if (cv_lq) begin
+      lq_inst[lq_t] <= cv_inst_i; lq_a[lq_t] <= cv_a_i; lq_sqb[lq_t] <= cv_sqb_i;
+      lq_qold[lq_t] <= q_n - ($clog2(QD)+1)'(x_start);
+      lq_mk[lq_t]   <= cv_mk_i; lq_pd[lq_t] <= cv_pd_i; lq_vd[lq_t] <= cv_vd_i; lq_ng[lq_t] <= cv_ng_i; lq_pg[lq_t] <= cv_pg_i;
+      lq_ws[lq_t]   <= cv_mk_i ? '0 : f_mrs(cvd);
+    end
+    // V5：跟着的标记 (头进 q 时它们比 q 里多一条老的)
+    for (int k = 1; k < NVC; k++)
+      if (3'(k) < cv_gon_i) begin
+        logic [LQW-1:0] p;
+        p = lq_t + LQW'(cv_lq) + LQW'(k - 1);
+        lq_inst[p] <= cvx_inst_i[k]; lq_a[p] <= '0; lq_sqb[p] <= cv_sqb_i;
+        lq_qold[p] <= q_n + ($clog2(QD)+1)'(cv_q) - ($clog2(QD)+1)'(x_start);
+        lq_mk[p] <= 1'b1; lq_pd[p] <= cvx_pd_i[k]; lq_vd[p] <= cvx_vd_i[k]; lq_ng[p] <= cvx_ng_i[k]; lq_pg[p] <= cvx_pg_i[k];
+        lq_ws[p] <= '0;
+      end
     if (x_start) begin
       vdec_t d;
       xp_t   p;
@@ -1088,14 +1453,14 @@ module o6_vu
       if (d.k == K_VMVNR) begin d.op = A_EXT; d.allb = 1'b1; d.vm = 1'b1; end
       xi <= qi; xa <= q_a[q_h]; xd <= d; xb <= '0; xrm <= q_rm[q_h];
       xcw <= p.cw; xdw <= p.dw; xs2w <= p.s2w; xsew <= p.se; xvl <= p.n; xnb <= p.nb; xpn <= p.pn;
-      x_wm <= xwrs(d, p);
+      x_wm <= xwrs(d, p); x_rd <= xrds(d, p);
     end else if (x_busy && x_bdone) xb <= xb + 1'b1;
   end
 
   //--------------------------------------------------------------------------
   // 定宽取 / 放元素：宽度 w 是变量时按 case 展开成 4 种定宽切片 (综合成选择器 / 移位器)。
   // 不要写成 "for k: x[(j * w + k) % N]" 这种变量宽度乘变量下标的逐位循环 —— DC 会为每一位造乘法器和
-  // 上万输入的选择器 (VU 曾因此 elaborate 吃到 46 GB 内存)
+  // 上万输入的选择器 (VECU 曾因此 elaborate 吃到 46 GB 内存)
   //--------------------------------------------------------------------------
   function automatic logic [63:0] eget(input logic [DLEN-1:0] s, input int j, input logic [1:0] w);
     unique case (w)
@@ -1180,9 +1545,14 @@ module o6_vu
   //   新指令要 S2 空；走 S2 的指令经计分板可不等运算流水排空 (见 x_start)，同步指令要全部排空
   //--------------------------------------------------------------------------
   wire  [VLW-1:0]  e0_1  = VLW'(int'(xbx) << le);
-  wire  [DLEN-1:0] s1_vs2 = vslice(xd.vs2, xs2w, int'(e0_1));
-  wire  [DLEN-1:0] s1_vs1 = vslice(xd.vs1, xsew, int'(e0_1));
-  wire  [DLEN-1:0] s1_vd  = vslice(xd.vd,  xdw,  int'(e0_1));
+  // 读寄存器堆的函数 (vslice / velem 在函数体里读 vrf) 不能放在连续赋值里：连续赋值只对参数敏感，
+  //   寄存器堆在参数不变时更新会读到旧值 (I1.3 背靠背开始后暴露，仿真与综合不一致)。一律用 always_comb
+  logic [DLEN-1:0] s1_vs2, s1_vs1, s1_vd;
+  always_comb begin
+    s1_vs2 = vslice(xd.vs2, xs2w, int'(e0_1));
+    s1_vs1 = vslice(xd.vs1, xsew, int'(e0_1));
+    s1_vd  = vslice(xd.vd,  xdw,  int'(e0_1));
+  end
 
   // v0 里本拍的掩码位；体内元素 (e0 + j < vl)
   logic [NEB-1:0]  c_mask1, c_body1;
@@ -1268,7 +1638,7 @@ module o6_vu
   //--------------------------------------------------------------------------
   // 元素运算 (每种计算宽度一份)：返回 {饱和, 掩码位, 结果}
   //--------------------------------------------------------------------------
-  // 每个槽一个 o6_vu_alu (定义在本文件末尾)，按计算宽度 xcw 选出结果
+  // 每个槽一个 o6_vecu_alu (定义在本文件末尾)，按计算宽度 xcw 选出结果
 
   // 进位输入：merge 用掩码位做选择；进位类 (vadc / vsbc / 带 v0 的 vmadc / vmsbc) 用它作进位，其余为 0
   logic [NEB-1:0] c_cin;
@@ -1283,7 +1653,7 @@ module o6_vu
     localparam int W  = 8 << w;
     localparam int NS = DLEN / W;
     for (genvar e = 0; e < NS; e++) begin : g_s
-      o6_vu_alu #(.W(W), .NP(ANP)) u_alu (
+      o6_vecu_alu #(.W(W), .NP(ANP)) u_alu (
         .clk_i, .op_i(xd.op), .a_i(o_a[W*e +: W]), .b_i(o_b[W*e +: W]), .c_i(o_c[W*e +: W]),
         .cin_i(c_cin[e]), .xrm_i(vxrm), .r_o(c_r[w][W*e +: W]), .m_o(c_m[w][e]), .s_o(c_s[w][e])
       );
@@ -1302,6 +1672,7 @@ module o6_vu
   //   除 0：商全 1、余数 = 被除数；有符号溢出 (最小值 / -1)：商 = 被除数、余数 = 0 (与 Spike 一致)
   //--------------------------------------------------------------------------
   wire x_fp  = (xd.k == K_FEW) || (xd.k == K_FEWM) || (xd.k == K_FRED);   // 浮点引擎 (见后)
+  assign x_ff = ffk(xd, xsew);                     // 快车道 (I1.3a)：结果经槽写回，不走 S3
   logic            f_bdone;                // 浮点：写回拍 xb 的全部元素完成
   // 浮点各拍重叠：发射拍 xbi 可比写回拍 xb 超前一拍；结果按拍号奇偶放两个缓冲
   logic [VLW-1:0]  xbi;
@@ -1314,7 +1685,7 @@ module o6_vu
   wire  [6:0]     dv_w = 7'(8 << xcw);
   logic           df_go, df_done;          // 点积最后一拍在 S2 / 最后一步已算完 (见点积)
   assign s2_adv  = s2_v && (!x_div || (dv_ld && dv_cnt == '0)) && !(df_go && !df_done);   // 除法迭代 / 点积最后一步时停
-  assign x_bdone = x_fp ? f_bdone : x_s2k ? (!s2_v || s2_adv) : 1'b1;
+  assign x_bdone = x_ff ? 1'b0 : x_fp ? f_bdone : x_s2k ? (!s2_v || s2_adv) : 1'b1;   // 快车道不经 S3 (见 x_ffend)
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) dv_ld <= 1'b0;
     else if (s2_v && x_div) begin
@@ -1323,12 +1694,12 @@ module o6_vu
       else dv_ld <= 1'b0;
     end
   end
-  // 每槽一个除法器 o6_vu_dvs (定义在本文件末尾)；槽 j 的位宽 = 它能遇到的最大元素宽度 (j < DLEN / W)
+  // 每槽一个除法器 o6_vecu_dvs (定义在本文件末尾)；槽 j 的位宽 = 它能遇到的最大元素宽度 (j < DLEN / W)
   logic [63:0] dv_y [NEB];
   for (genvar j = 0; j < NEB; j++) begin : g_dv
     localparam int DW = (j < DLEN / 64) ? 64 : (j < DLEN / 32) ? 32 : (j < DLEN / 16) ? 16 : 8;
     logic [DW-1:0] y;
-    o6_vu_dvs #(.W(DW)) u_dv (
+    o6_vecu_dvs #(.W(DW)) u_dv (
       .clk_i,
       .ld_i(s2_v && x_div && !dv_ld), .step_i(s2_v && x_div && dv_ld && dv_cnt != '0),
       .cw_i(xcw), .sgn_i(x_sgn), .div_i(xd.op == A_DIVU || xd.op == A_DIV),
@@ -1481,7 +1852,8 @@ module o6_vu
   always_ff @(posedge clk_i or negedge rst_ni)
     if (!rst_ni) x_first <= 1'b0;
     else         x_first <= x_start;
-  wire  [DLEN-1:0] rd_init = vslice(xd.vs1, xdw, 0);
+  logic [DLEN-1:0] rd_init;
+  always_comb rd_init = vslice(xd.vs1, xdw, 0);
   always_ff @(posedge clk_i)
     if (rc[2].red) rd_acc <= rd_nacc;
 
@@ -2054,11 +2426,32 @@ module o6_vu
   logic [DLEN-1:0] si_vs2, si_vs1, si_vd;
   logic [NEB-1:0]  i_act;
   logic            i_bend;
+  // I1.3a2：快车道指令开始那拍就按队头预读第 0 拍的切片 (x_pre)，开始后那拍即可发射 (省掉 x_first 空拍)。
+  //   计分板已保证它读的寄存器不在运算流水 / 快车道槽 / load 写回里；S3 本拍要写的不在计分板里，有 S3 时不预读
+  logic            x_pre;
+`ifdef O6_NO_FFPRE
+  wire             q_pre = 1'b0;
+`else
+  wire             q_pre = x_start && q_ffk && !s3_v;
+`endif
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) x_pre <= 1'b0;
+    else         x_pre <= q_pre;
   always_ff @(posedge clk_i)
-    if (x_first || i_bend) begin
+    if (q_pre) begin
+      logic [5:0]     lq;
+      logic [NEB-1:0] mk;
+      lq = 6'(LDLEN - 3 - int'(qp.cw));
+      si_vs2 <= vslice(qd.vs2, qp.s2w, 0);
+      si_vs1 <= vslice(qd.vs1, qp.se,  0);
+      si_vd  <= vslice(qd.vd,  qp.dw,  0);
+      mk = NEB'(vrf[0]);
+      for (int j = 0; j < NEB; j++)
+        i_act[j] <= (j < (1 << lq)) && (j < int'(qp.n)) && (qd.vm || qd.allb || mk[j]);
+    end else if ((x_first && !x_pre) || i_bend) begin
       logic [VLW-1:0] e0n, bn;
       logic [NEB-1:0] mk;
-      bn  = x_first ? '0 : xbi + 1'b1;
+      bn  = (x_first && !x_pre) ? '0 : xbi + 1'b1;          // 预读过第 0 拍的：开始后那拍发完即装下一拍
       e0n = VLW'(int'(bn) << le);
       si_vs2 <= vslice(xd.vs2, xs2w, int'(e0n));
       si_vs1 <= vslice(xd.vs1, xsew, int'(e0n));
@@ -2068,19 +2461,31 @@ module o6_vu
         i_act[j] <= (j < (1 << le)) && (int'(e0n) + j < int'(xvl)) && (xd.vm || xd.allb || mk[j]);
     end
   // 可以发射：还有拍、没超前写回拍两拍 (缓冲)、切片已装好 (开始后那一拍不发)；归约不超前 (逐个串行，结果回来再发下一个)
-  wire             i_ok   = x_busy && x_fp && !x_first && (xbi < xnb) && (xbi - xb < VLW'(2)) && !(x_red && xbi != xb);
+  //   快车道：不看写回拍 (不用缓冲)，只要槽没满；各通道同拍前进 (ADDMUL 全流水，fi_rdy 恒 1，断言)
+  wire             i_ok   = x_busy && x_fp && !(x_first && !x_pre) && (xbi < xnb) &&
+                            (x_ff ? !ff_full : ((xbi - xb < VLW'(2)) && !(x_red && xbi != xb)));
   logic [63:0]     f_acc;                                // 归约累加器 (目的宽度)
   logic            f_any;                                // 归约：有过活动元素
 
   // 各通道本拍的元素号、是否完成
+  //   I1.3a2：快车道 SEW <= 32 时每通道每拍两个元素 (主实例 A 发 j，副实例 B 发 j + NFL，B 只有 ADDMUL、不含 FP64)
+`ifdef O6_NO_FFB
+  wire             ffp = 1'b0;
+`else
+  wire             ffp = x_ff && (xsew != 2'd3);
+`endif
   logic [EW-1:0]   fl_j   [NFL];
+  logic [EW-1:0]   fl2_j  [NFL];
   logic [NFL-1:0]  fl_end, fl_act, fl_go;               // 完成 / 当前元素活动 / 要发 (fpnew)
+  logic [NFL-1:0]  fl2_go;                              // 副实例要发
   always_comb begin
     for (int l = 0; l < NFL; l++) begin
-      fl_j[l]   = x_red ? EW'(f_k[0]) : EW'(l + NFL * int'(f_k[l]));
+      fl_j[l]   = x_red ? EW'(f_k[0]) : ffp ? EW'(l + 2 * NFL * int'(f_k[l])) : EW'(l + NFL * int'(f_k[l]));
+      fl2_j[l]  = fl_j[l] + EW'(NFL);
       fl_end[l] = x_red ? (l != 0 || f_k[0] >= f_ne) : (fl_j[l] >= f_ne);
       fl_act[l] = !fl_end[l] && i_act[fl_j[l] % NEB];
       fl_go[l]  = i_ok && fl_act[l] && !x_loc && !(x_red && f_on != '0);
+      fl2_go[l] = i_ok && ffp && !fl_end[l] && (fl2_j[l] < f_ne) && i_act[fl2_j[l] % NEB];
     end
   end
 
@@ -2194,6 +2599,40 @@ module o6_vu
     end
   end
 
+  // 副实例 B 的请求 (I1.3a2，快车道 SEW <= 32)：只有单宽度 ADDMUL 类，操作数排法与主实例相同
+  function automatic vfreq_t ffreq(input aop_e op, input logic [63:0] a0, input logic [63:0] b0, input logic [63:0] c0,
+                                   input logic [1:0] w, input logic [2:0] rm);
+    vfreq_t q;
+    logic [63:0] a, b, c;
+    a = fbox(a0, w); b = fbox(b0, w); c = fbox(c0, w);
+    q.op = fpnew_pkg::ADD; q.mod = 1'b0; q.rnd = fpnew_pkg::roundmode_e'(rm);
+    q.src_fmt = ffmt(w, 1'b0); q.dst_fmt = ffmt(w, 1'b0); q.int_fmt = fpnew_pkg::INT64;
+    q.opnd = {b, a, 64'd0};
+    unique case (op)
+      F_SUB:   q.mod = 1'b1;
+      F_RSUB:  begin q.mod = 1'b1; q.opnd = {a, b, 64'd0}; end
+      F_MUL:   begin q.op = fpnew_pkg::MUL; q.opnd = {64'd0, b, a}; end
+      F_MACC:  begin q.op = fpnew_pkg::FMADD;  q.opnd = {c, a, b}; end
+      F_NMACC: begin q.op = fpnew_pkg::FNMSUB; q.mod = 1'b1; q.opnd = {c, a, b}; end
+      F_MSAC:  begin q.op = fpnew_pkg::FMADD;  q.mod = 1'b1; q.opnd = {c, a, b}; end
+      F_NMSAC: begin q.op = fpnew_pkg::FNMSUB; q.opnd = {c, a, b}; end
+      F_MADD:  begin q.op = fpnew_pkg::FMADD;  q.opnd = {a, b, c}; end
+      F_NMADD: begin q.op = fpnew_pkg::FNMSUB; q.mod = 1'b1; q.opnd = {a, b, c}; end
+      F_MSUB:  begin q.op = fpnew_pkg::FMADD;  q.mod = 1'b1; q.opnd = {a, b, c}; end
+      F_NMSUB: begin q.op = fpnew_pkg::FNMSUB; q.opnd = {a, b, c}; end
+      default: ;                                       // F_ADD
+    endcase
+    return q;
+  endfunction
+  vfreq_t          fq2   [NFL];
+  always_comb
+    for (int l = 0; l < NFL; l++) begin
+      int j;
+      j = int'(fl2_j[l]);
+      fq2[l] = ffreq(xd.op, eget(si_vs2, j, xs2w), (xd.src != 2'd0) ? xa : eget(si_vs1, j, xsew),
+                     eget(si_vd, j, xdw), xcw, xrm);
+    end
+
   // fpnew 通道
   localparam fpnew_pkg::fpu_features_t VFEAT = '{
     Width:         64,
@@ -2229,6 +2668,22 @@ module o6_vu
                   '{default: fpnew_pkg::DISABLED}},
     PipeConfig: fpnew_pkg::DISTRIBUTED
   };
+  // 副实例 B (I1.3a2)：只有 ADDMUL (FP32 / FP16 / BF16，无 FP64)，级数与主实例相同 (延迟相同，两边同拍回来)
+  localparam fpnew_pkg::fpu_features_t VFEAT2 = '{
+    Width:         64,
+    EnableVectors: 1'b0,
+    EnableNanBox:  1'b1,
+    FpFmtMask:     5'b10101,                             // FP32 FP16 FP16ALT
+    IntFmtMask:    4'b0000
+  };
+  localparam fpnew_pkg::fpu_implementation_t VIMPL2 = '{
+    PipeRegs:   '{'{3, 3, 3, 3, 3}, '{0, 0, 0, 0, 0}, '{0, 0, 0, 0, 0}, '{0, 0, 0, 0, 0}},
+    UnitTypes:  '{'{fpnew_pkg::MERGED, fpnew_pkg::DISABLED, fpnew_pkg::MERGED, fpnew_pkg::DISABLED, fpnew_pkg::MERGED},
+                  '{default: fpnew_pkg::DISABLED},
+                  '{default: fpnew_pkg::DISABLED},
+                  '{default: fpnew_pkg::DISABLED}},
+    PipeConfig: fpnew_pkg::DISTRIBUTED
+  };
   // UD 时钟：ud_en = 1 表示本拍末是 UD 的时钟沿
   logic ud_en, clk_ud;
 `ifdef O6_UD_HALF
@@ -2245,14 +2700,64 @@ module o6_vu
   logic [NFL-1:0]  fo_v, fi_rdy;
   logic [63:0]     fo_r   [NFL];
   fpnew_pkg::status_t fo_st [NFL];
-  logic [EW:0]     fo_tag [NFL];                       // {拍号奇偶, 元素号}
-  for (genvar l = 0; l < NFL; l++) begin : g_fl
-`ifdef O6_VU_FPBB
-    // 时序摸底 (综合 VU_FPBB=1)：fpnew 换成寄存器桩，只看 o6_vu 自身的路径
+  // 标签 {快车道, 槽号, 拍号奇偶, 元素号}：快车道的结果按槽写回 (I1.3a)，其余按拍号奇偶进结果缓冲
+  localparam int FTW = EW + 2 + SLW;
+  logic [FTW-1:0]  fo_tag [NFL];
+  logic [FTW-1:0]  fi_tag [NFL];
+  always_comb for (int l = 0; l < NFL; l++) fi_tag[l] = {x_ff, sl_h, xbi[0], fl_j[l]};
+  // 副实例 B 的输出 (只有快车道用)
+  logic [NFL-1:0]  fo2_v;
+  logic [63:0]     fo2_r   [NFL];
+  fpnew_pkg::status_t fo2_st [NFL];
+  logic [FTW-1:0]  fo2_tag [NFL];
+  for (genvar l = 0; l < NFL; l++) begin : g_fl2
+`ifdef O6_VECU_FPBB
     logic [4:0] st;
-    o6_vu_fpbb #(.TW(EW + 1), .CW($bits(vfreq_t) - 192)) u_fpnew (
+    o6_vecu_fpbb #(.TW(FTW), .CW($bits(vfreq_t) - 192)) u_fp2 (
+      .clk_i, .opnd_i(fq2[l].opnd), .ctl_i(fq2[l][$bits(vfreq_t)-1:192]),
+      .tag_i({1'b1, sl_h, xbi[0], fl2_j[l]}), .v_i(fl2_go[l]),
+      .r_o(fo2_r[l]), .st_o(st), .tag_o(fo2_tag[l]), .v_o(fo2_v[l])
+    );
+    assign fo2_st[l] = fpnew_pkg::status_t'(st);
+`else
+    fpnew_top #(
+      .Features       (VFEAT2),
+      .Implementation (VIMPL2),
+      .DivSqrtSel     (fpnew_pkg::THMULTI),
+      .TagType        (logic [FTW-1:0])
+    ) u_fp2 (
+      .clk_i,
+      .rst_ni,
+      .operands_i    (fq2[l].opnd),
+      .rnd_mode_i    (fq2[l].rnd),
+      .op_i          (fq2[l].op),
+      .op_mod_i      (fq2[l].mod),
+      .src_fmt_i     (fq2[l].src_fmt),
+      .dst_fmt_i     (fq2[l].dst_fmt),
+      .int_fmt_i     (fq2[l].int_fmt),
+      .vectorial_op_i(1'b0),
+      .tag_i         ({1'b1, sl_h, xbi[0], fl2_j[l]}),
+      .simd_mask_i   (1'b1),
+      .in_valid_i    (fl2_go[l]),
+      .in_ready_o    (),
+      .flush_i       (1'b0),
+      .result_o      (fo2_r[l]),
+      .status_o      (fo2_st[l]),
+      .tag_o         (fo2_tag[l]),
+      .out_valid_o   (fo2_v[l]),
+      .out_ready_i   (1'b1),
+      .busy_o        (),
+      .early_valid_o ()
+    );
+`endif
+  end
+  for (genvar l = 0; l < NFL; l++) begin : g_fl
+`ifdef O6_VECU_FPBB
+    // 时序摸底 (综合 VECU_FPBB=1)：fpnew 换成寄存器桩，只看 o6_vecu 自身的路径
+    logic [4:0] st;
+    o6_vecu_fpbb #(.TW(FTW), .CW($bits(vfreq_t) - 192)) u_fpnew (
       .clk_i, .opnd_i(fq[l].opnd), .ctl_i(fq[l][$bits(vfreq_t)-1:192]),
-      .tag_i({xbi[0], fl_j[l]}), .v_i(fl_go[l]),
+      .tag_i(fi_tag[l]), .v_i(fl_go[l]),
       .r_o(fo_r[l]), .st_o(st), .tag_o(fo_tag[l]), .v_o(fo_v[l])
     );
     assign fi_rdy[l] = 1'b1;
@@ -2262,12 +2767,12 @@ module o6_vu
     logic               m_rdy, m_v, d_rdy, d_v;
     logic [63:0]        m_r, d_r;
     fpnew_pkg::status_t m_st, d_st;
-    logic [EW:0]        m_tag, d_tag;
+    logic [FTW-1:0]     m_tag, d_tag;
     fpnew_top #(
       .Features       (VFEAT),
       .Implementation (VIMPL),
       .DivSqrtSel     (fpnew_pkg::THMULTI),
-      .TagType        (logic [EW:0])
+      .TagType        (logic [FTW-1:0])
     ) u_fpnew (
       .clk_i,
       .rst_ni,
@@ -2279,7 +2784,7 @@ module o6_vu
       .dst_fmt_i     (fq[l].dst_fmt),
       .int_fmt_i     (fq[l].int_fmt),
       .vectorial_op_i(1'b0),
-      .tag_i         ({xbi[0], fl_j[l]}),
+      .tag_i         (fi_tag[l]),
       .simd_mask_i   (1'b1),
       .in_valid_i    (fl_go[l] && !is_ud),
       .in_ready_o    (m_rdy),
@@ -2293,20 +2798,20 @@ module o6_vu
       .early_valid_o ()
     );
     // UD 请求保持：发出那拍记下，UD 时钟沿收下后清掉；结果只在 UD 时钟沿前一拍取走 (UD 同沿出队)
-    logic        udh_v;
-    vfreq_t      udh_rq;
-    logic [EW:0] udh_tag;
+    logic           udh_v;
+    vfreq_t         udh_rq;
+    logic [FTW-1:0] udh_tag;
     always_ff @(posedge clk_i or negedge rst_ni)
       if (!rst_ni) udh_v <= 1'b0;
       else if (fl_go[l] && is_ud && !udh_v) udh_v <= 1'b1;
       else if (udh_v && ud_en && d_rdy) udh_v <= 1'b0;
     always_ff @(posedge clk_i)
-      if (fl_go[l] && is_ud && !udh_v) begin udh_rq <= fq[l]; udh_tag <= {xbi[0], fl_j[l]}; end
+      if (fl_go[l] && is_ud && !udh_v) begin udh_rq <= fq[l]; udh_tag <= fi_tag[l]; end
     fpnew_top #(
       .Features       (VFEAT),
       .Implementation (VIMPL_UD),
       .DivSqrtSel     (fpnew_pkg::THMULTI),
-      .TagType        (logic [EW:0])
+      .TagType        (logic [FTW-1:0])
     ) u_ud (
       .clk_i         (clk_ud),
       .rst_ni,
@@ -2340,7 +2845,7 @@ module o6_vu
     assign fo_tag[l] = d_fire ? d_tag : m_tag;
 `ifndef SYNTHESIS
     always_ff @(posedge clk_i)
-      if (rst_ni) assert (!(m_v && d_fire)) else $error("vu: fpnew 主实例与 UD 同拍出结果");
+      if (rst_ni) assert (!(m_v && d_fire)) else $error("vecu: fpnew 主实例与 UD 同拍出结果");
 `endif
 `endif
   end
@@ -2356,7 +2861,10 @@ module o6_vu
                    (fl_fire[l] || fl_loc[l] || !fl_act[l]);
     end
   end
-  assign i_bend = i_ok && (&fl_end);                     // 发射拍全部发出 / 跳过
+  // 发射拍全部发出 / 跳过。快车道各通道同拍前进 (E 是 NFL 的整数倍)，在发最后一组的那拍就结束 (不空等一拍)
+  wire ff_lastg = (int'(f_k[0]) + 1) * NFL * (ffp ? 2 : 1) >= int'(f_ne);
+  assign i_bend  = x_ff ? (i_ok && ff_lastg) : (i_ok && (&fl_end));
+  assign x_ffend = x_busy && x_ff && i_bend && (xbi + 1'b1 >= xnb);
   // 写回拍完成：它已全部发出，且它那个缓冲的结果都回来了
   assign f_bdone = x_fp && f_idn[xb[0]] && (f_onb[xb[0]] == '0);
 
@@ -2377,9 +2885,9 @@ module o6_vu
     end else begin
       logic [EW-1:0] n [2];
       n[0] = f_onb[0]; n[1] = f_onb[1];
-      for (int l = 0; l < NFL; l++) begin
-        if (fl_fire[l]) n[xbi[0]] = n[xbi[0]] + 1'b1;
-        if (fo_v[l])    n[fo_tag[l][EW]] = n[fo_tag[l][EW]] - 1'b1;
+      for (int l = 0; l < NFL; l++) begin                // 快车道的元素不计 (按槽)
+        if (fl_fire[l] && !x_ff)            n[xbi[0]] = n[xbi[0]] + 1'b1;
+        if (fo_v[l] && !fo_tag[l][FTW-1])   n[fo_tag[l][EW]] = n[fo_tag[l][EW]] - 1'b1;
       end
       f_onb[0] <= n[0]; f_onb[1] <= n[1];
       if (x_start) begin
@@ -2404,7 +2912,7 @@ module o6_vu
       nr[0] = f_res2[0]; nr[1] = f_res2[1];
       for (int l = 0; l < NFL; l++) begin
         if (x_red && fl_fire[l]) f_any <= 1'b1;
-        if (fo_v[l]) begin
+        if (fo_v[l] && !fo_tag[l][FTW-1]) begin
           int j;
           logic bp;
           j  = int'(fo_tag[l][EW-1:0]);
@@ -2423,11 +2931,72 @@ module o6_vu
     end
   end
 
+  //--------------------------------------------------------------------------
+  // 快车道的槽 (I1.3a)：有元素发出的发射拍分配一个 (本拍 sl_h)；结果回来那拍 (各通道同拍) 按槽经 E 口写、释放。
+  //   单宽度：计算宽度 = 目的宽度，一拍正好占满目的寄存器的一个 DLEN 块 (块内偏移 0)
+  //--------------------------------------------------------------------------
+  wire             ff_alloc = i_ok && x_ff && ((|fl_fire) || (|fl2_go));
+  logic            fr_v;                                   // 本拍有快车道结果回来
+  logic [SLW-1:0]  fr_s;                                   // 它们的槽
+  logic [DLEN-1:0] fr_d, fr_m;                             // 块内数据 / 位写使能
+  always_comb begin
+    fr_v = 1'b0; fr_s = '0; fr_d = '0; fr_m = '0;
+    for (int l = 0; l < NFL; l++) begin
+      if (fo_v[l] && fo_tag[l][FTW-1]) begin fr_v = 1'b1; fr_s = fo_tag[l][FTW-2 -: SLW]; end
+      if (fo2_v[l])                    begin fr_v = 1'b1; fr_s = fo2_tag[l][FTW-2 -: SLW]; end
+    end
+    for (int l = 0; l < NFL; l++) begin
+      if (fo_v[l] && fo_tag[l][FTW-1]) begin
+        int j;
+        j = int'(fo_tag[l][EW-1:0]);
+        fr_d = fr_d | eput(fo_r[l], j, sl[fr_s].dw);
+        fr_m = fr_m | eput('1, j, sl[fr_s].dw);
+      end
+      if (fo2_v[l]) begin
+        int j;
+        j = int'(fo2_tag[l][EW-1:0]);
+        fr_d = fr_d | eput(fo2_r[l], j, sl[fr_s].dw);
+        fr_m = fr_m | eput('1, j, sl[fr_s].dw);
+      end
+    end
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      sl_v <= '0; sl_h <= '0;
+    end else begin
+      if (fr_v) sl_v[fr_s] <= 1'b0;
+      if (ff_alloc) begin sl_v[sl_h] <= 1'b1; sl_h <= sl_h + 1'b1; end
+    end
+  end
+  always_ff @(posedge clk_i)
+    if (ff_alloc) begin
+      logic [13:0] bo;
+      bo = 14'((int'(xbi) << le) << (int'(xdw) + 3));     // 本拍第一个元素在寄存器组里的位偏移
+      sl[sl_h] <= '{r: xd.vd + 5'(bo >> LVLEN), blk: 4'((bo % VLEN) >> LDLEN), dw: xdw};
+    end
+`ifndef SYNTHESIS
+  // 同拍回来的快车道结果属于同一个槽；快车道发射时 fpnew 都收 (各通道同拍前进)；ADDMUL 延迟小于槽数
+  always_ff @(posedge clk_i)
+    if (rst_ni) begin
+      for (int l = 0; l < NFL; l++) begin
+        if (fo_v[l] && fo_tag[l][FTW-1])
+          assert (fo_tag[l][FTW-2 -: SLW] == fr_s && sl_v[fr_s]) else $error("vecu: 快车道同拍结果不属于同一个在途槽");
+        if (x_ff && fl_go[l]) assert (fi_rdy[l]) else $error("vecu: 快车道发射时 fpnew 通道 %0d 未就绪", l);
+        if (fo_v[l] && !fo_tag[l][FTW-1]) assert (sl_v == '0 || !fr_v) else $error("vecu: 快车道与原浮点路径的结果同拍");
+        if (fo2_v[l]) assert (fo2_tag[l][FTW-1] && fo2_tag[l][FTW-2 -: SLW] == fr_s && sl_v[fr_s])
+          else $error("vecu: 副实例 B 的结果不属于本拍的在途槽");
+        if (fl2_go[l]) assert (x_ff && ffp) else $error("vecu: 副实例 B 只给快车道 SEW <= 32 用");
+      end
+      if (fr_v && ff_alloc) assert (fr_s != sl_h) else $error("vecu: 快车道槽满仍分配");
+    end
+`endif
+
   // 异常标志：结果出来时 (fpnew 状态)、发出时 (升格式的 NV)、本地估算、归约收尾
   always_comb begin
     fflags_o = '0;
     for (int l = 0; l < NFL; l++) begin
       if (fo_v[l])    fflags_o |= fo_st[l];
+      if (fo2_v[l])   fflags_o |= fo2_st[l];
       if (fl_fire[l]) fflags_o[4] |= fq_nv[l];
       if (fl_loc[l])  fflags_o |= fq_est[l][68:64];
     end
@@ -2533,31 +3102,130 @@ module o6_vu
   //   全部被掩掉的不访存；元素地址不对齐报地址不对齐；出错时 vstart = 出错的 (第一个活动) 元素，
   //   之前的元素与本元素之前的段已写；fault-only-first 在第 0 个元素之后出错时不报异常，vl 截到该元素
   //==========================================================================
-  wire  [1:0]     m_dw  = (rq.mm == M_IDX) ? sew : rq.eb;                     // 数据元素宽度 (log2 字节)
-  wire  [3:0]     m_nfe = (rq.mm == M_WHOLE) ? 4'd1 : 4'(rq.nf) + 4'd1;       // 段数
-  wire            m_grp = (rq.mm != M_STRD) && (rq.mm != M_IDX) && (m_nfe == 4'd1);
-  logic [VLW-1:0] m_evl;                         // 元素数
-  logic [3:0]     m_fs;                          // 段间寄存器间隔
-  always_comb begin
+  // I2a：引擎按锁存的 me_i / me_a / me_b 做 (md)，不再用请求口的 rq / ra_q / rb_q (异步 load 做的时候请求口可能来新的同步指令)
+  vdec_t          md;
+  always_comb md = vdec(me_i);
+  function automatic logic [1:0] f_mdw(input vdec_t d);                       // 数据元素宽度 (log2 字节)
+    return (d.mm == M_IDX) ? sew : d.eb;
+  endfunction
+  function automatic logic [3:0] f_nfe(input vdec_t d);                       // 段数
+    return (d.mm == M_WHOLE) ? 4'd1 : 4'(d.nf) + 4'd1;
+  endfunction
+  function automatic logic [3:0] f_mfs(input vdec_t d);                       // 段间寄存器间隔
     int le, ll;
     ll = lmul_log2(lmul);
-    le = int'(rq.eb) - int'(sew) + ll;
-    unique case (rq.mm)
-      M_WHOLE: m_evl = VLW'(((int'(rq.nf) + 1) * (VLEN / 8)) >> rq.eb);
+    le = int'(d.eb) - int'(sew) + ll;
+    if (d.mm == M_IDX) return (ll > 0) ? 4'(1 << ll) : 4'd1;
+    else               return (le > 0) ? 4'(1 << le) : 4'd1;
+  endfunction
+  // 相邻元素的地址间隔：跨步 = rs2，其余 = 段数 * W (索引方式不用)
+  function automatic logic [63:0] f_mes(input vdec_t d, input logic [63:0] b);
+    return (d.mm == M_STRD) ? b : (64'(f_nfe(d)) << f_mdw(d));
+  endfunction
+  // I1.3c 开始条件用的读写集合 (保守：数据组 vd 起段数 × 段间隔个 / 整寄存器 nf + 1 个，索引组 vs2 起 8 个，v0)
+  function automatic logic [31:0] f_mrs(input vdec_t d);
+    logic [31:0] m;
+    int          nr;
+    nr = (d.mm == M_WHOLE) ? int'(d.nf) + 1 : (d.mm == M_MASK) ? 1 : int'(f_nfe(d)) * int'(f_mfs(d));
+    m = rgm(d.vd, nr);
+    if (d.mm == M_IDX) m = m | rgm(d.vs2, 8);
+    if (!d.vm)         m[0] = 1'b1;
+    return m;
+  endfunction
+  // (这些函数读 sew / lmul / vl：一律 always_comb，连续赋值只对参数敏感)
+  logic [1:0]     m_dw;                          // 数据元素宽度
+  logic [3:0]     m_nfe;                         // 段数
+  logic           m_grp;                         // 合并方式
+  logic [VLW-1:0] m_evl;                         // 元素数
+  logic [3:0]     m_fs;                          // 段间寄存器间隔
+  logic [63:0]    m_es;                          // 相邻元素的地址间隔
+  always_comb begin
+    m_dw  = f_mdw(md);
+    m_nfe = f_nfe(md);
+    m_grp = (md.mm != M_STRD) && (md.mm != M_IDX) && (m_nfe == 4'd1);
+    m_fs  = f_mfs(md);
+    m_es  = f_mes(md, me_b);
+    unique case (md.mm)
+      M_WHOLE: m_evl = VLW'(((int'(md.nf) + 1) * (VLEN / 8)) >> md.eb);
       M_MASK:  m_evl = VLW'((int'(vl) + 7) >> 3);
       default: m_evl = vl;
     endcase
-    if (rq.mm == M_IDX) m_fs = (ll > 0) ? 4'(1 << ll) : 4'd1;
-    else                 m_fs = (le > 0) ? 4'(1 << le) : 4'd1;
   end
-  // 相邻元素的地址间隔：跨步 = rs2，其余 = 段数 * W (索引方式不用)
-  wire  [63:0]    m_es = (rq.mm == M_STRD) ? rb_q : (64'(m_nfe) << m_dw);
+
+  // I1.3c 开始条件 (同步的向量访存)：原来要全部排空 (drained)。现在：队列空、执行流水发完 (S1 / S2 / S3 空，读都已做完)、
+  //   上一条 load 的写回结束，且运算流水 / 浮点快车道在途的写与本条读写的寄存器不相交。在途的写之后经 A / E 口落地，
+  //   与 load 的 B / C / D 口不同寄存器。I2a：还要访存队列空、引擎空 (比它老的异步 load 先做完)
+  logic [31:0] m_rset;
+  always_comb m_rset = f_mrs(rq);
+`ifdef O6_NO_MEMSB
+  assign mem_ok = drained;
+`else
+  assign mem_ok = (q_n == '0) && (lq_n == '0) && !m_on && !rn_any && !x_busy && !s2_v && !s3_v && !m_tail &&
+                  ((m_rset & (p_wr | ff_wr)) == '0);
+`endif
+  wire   m_go   = (rs == R_SYNC) && (rq.k == K_VMEM) && mem_ok;
+  // I2a 异步 load 开始 (不改名的：带掩码的，或关了改名)：访存队列头比 q 里剩下的都老 (qold = 0：比它老的运算都已开始)、
+  //   引擎空、上一条 load 写回完，且比它老的运算都已读完源 (执行流水发完、S2 / S3 空) 并且在途的写与它读写的寄存器不相交
+  //   (同 mem_ok，只是不要求 q 空：q 里剩下的都比它年轻，由 x_start 的 lq_hold / me_rset 挡住)
+  // I2b 改名的 (不带掩码，目的组不越过 v31)：不等比它老的运算 (它们照旧读写旧的物理寄存器)，只等引擎空、上一个改名已切换
+  vdec_t       lqd;
+  logic [31:0] ma_rset;
+  logic [3:0]  lq_rn;            // 访存队列头的目的组大小 (改名用；0 = 不改名)
+  always_comb begin
+    int nr;
+    lqd     = vdec(lq_inst[lq_h]);
+    ma_rset = f_mrs(lqd);
+    nr      = (lqd.mm == M_WHOLE) ? int'(lqd.nf) + 1 : (lqd.mm == M_MASK) ? 1 : int'(f_nfe(lqd)) * int'(f_mfs(lqd));
+    lq_rn   = (RN_EN && lqd.vm && nr <= 8 && int'(lqd.vd) + nr <= 32) ? 4'(nr) : 4'd0;
+  end
+  wire   ma_eng = (lq_n != '0) && !lq_mk[lq_h] && !m_on && !m_tail;           // 引擎可接下一条异步 load (队头不是 O1 切换标记)
+  // I2c：改名 FIFO 尾项空即可开始 (上一条可能还没切换)；不改名的 (原地写 crat) 要等在途改名都切换完
+  //   O1：VECU 池 (VNP 个) 要有够目的组用的空闲
+  wire   ma_gor = ma_eng && (lq_rn != '0) && !rq_v[rq_t] && (fr_n >= (FRW+1)'(lq_rn));
+  wire   ma_gon = ma_eng && (lq_rn == '0) && !rn_any && lq_hold && !x_busy && !s2_v && !s3_v &&
+                  ((ma_rset & (p_wr | ff_wr)) == '0);
+  assign ma_go  = ma_gor || ma_gon;
+  wire   m_gox = m_go || ma_go;                  // 引擎开始 (同步 / 异步)
+  vdec_t       mnd;                              // 开始那拍：新的这条的译码 / x[rs1] / x[rs2]
+  logic [63:0] mn_a, mn_b;
+  always_comb begin
+    mnd  = m_go ? rq   : lqd;
+    mn_a = m_go ? ra_q : lq_a[lq_h];
+    mn_b = m_go ? rb_q : 64'd0;
+  end
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni)                       begin m_on <= 1'b0; m_as <= 1'b0; end
+    else if (m_gox)                    begin m_on <= 1'b1; m_as <= ma_go; end
+    else if (m_on && (m_fin || m_early)) m_on <= 1'b0;
+  always_ff @(posedge clk_i)
+    if (m_gox) begin
+      me_i    <= m_go ? ri_q : lq_inst[lq_h];
+      me_a    <= mn_a; me_b <= mn_b;
+      me_sqb  <= lq_sqb[lq_h];
+      me_rset <= m_go ? m_rset : ma_rset;
+    end
+  // LSU：引擎这条是异步 load 时访问 D$ 只等比它老的 store；最老的未做完的异步 load 的 SQ 界 (引擎里的，写回完为止；否则访存队列头)
+  wire   m_aact = m_as && (m_on || m_tail);
+  assign vm_async_o = m_on && m_as;
+  assign vm_sqb_o   = me_sqb;
+  // O1：lq 里还有切换标记，界取最老的那条 load
+  logic           lq_ldv;
+  logic [LQW-1:0] lq_ldi;
+  always_comb begin
+    lq_ldv = 1'b0; lq_ldi = lq_h;
+    for (int k = LQD - 1; k >= 0; k--)
+      if ((LQW+1)'(k) < lq_n && !lq_mk[LQW'(lq_h + LQW'(k))]) begin lq_ldv = 1'b1; lq_ldi = LQW'(lq_h + LQW'(k)); end
+  end
+  assign vbar_v_o   = m_aact || lq_ldv;
+  assign vbar_o     = m_aact ? me_sqb : lq_sqb[lq_ldi];
+  assign vasync_o   = vbar_v_o;
 
   logic [VLW-1:0] m_i;                           // 当前元素
   logic [2:0]     m_f;                           // 当前段
   logic [63:0]    m_a;                           // 当前元素 (第 0 段) 的地址 (索引方式不用)
-  wire  [63:0]    m_idx = velem(rq.vs2, rq.eb, 64'(m_i));                      // 索引 (零扩展)
-  wire  [63:0]    m_ax  = ((rq.mm == M_IDX) ? ra_q + m_idx : m_a) + (64'(m_f) << m_dw);   // 本次访问的地址
+  logic [63:0]    m_idx;                                                       // 索引 (零扩展)
+  always_comb m_idx = velem(md.vs2, md.eb, 64'(m_i));
+  wire  [63:0]    m_ax  = ((md.mm == M_IDX) ? me_a + m_idx : m_a) + (64'(m_f) << m_dw);   // 本次访问的地址
   wire  [3:0]     m_ebytes = 4'd1 << m_dw;
   wire  [5:0]     m_off = m_ax[5:0];                      // 行内偏移
   wire            m_mis = (m_ax & 64'(m_ebytes - 1)) != '0;
@@ -2573,7 +3241,7 @@ module o6_vu
   // 一段最多 64 字节，最多跨两个寄存器 r0 / r1 (r0 内从 p0 起)
   localparam int VLB = VLEN / 8;                          // 每个寄存器的字节数
   wire  [10:0]    m_gb  = 11'(int'(m_i) << m_dw);
-  wire  [4:0]     m_r0  = rq.vd + 5'(int'(m_f) * int'(m_fs)) + 5'(int'(m_gb) / VLB);
+  wire  [4:0]     m_r0  = md.vd + 5'(int'(m_f) * int'(m_fs)) + 5'(int'(m_gb) / VLB);
   wire  [4:0]     m_r1  = m_r0 + 5'd1;
   wire  [6:0]     m_p0  = 7'(int'(m_gb) % VLB);
   wire  [6:0]     m_len = 7'(int'(m_n) << m_dw);
@@ -2593,7 +3261,7 @@ module o6_vu
         2'd2:    ea = win[t >> 2];
         default: ea = win[t >> 3];
       endcase
-      m_tact[t] = (t < int'(m_len)) && (rq.vm || ea);
+      m_tact[t] = (t < int'(m_len)) && (md.vm || ea);
     end
     m_any = |m_tact;
     m_fe = m_i; m_fa = m_ax;
@@ -2604,15 +3272,75 @@ module o6_vu
       m_fa = m_ax + 64'(tz);
     end
   end
-  // store：读 r0 / r1 拼成 128 字节，右旋 p0 字节成段顺序，再放到行内 off 处
-  logic [VLEN-1:0] m_z, m_zr;
+  // P3 多行 (docs/11 §7a)：合并方式且第 0 行对齐时，同一次再带上紧接的 VM_NL-1 行 (同一页、还有元素)：
+  //   第 j 行 (j >= 1) 从行首起、整行 64 B，元素从 i_j = m_i + n_0 + (j-1) * (64 / W) 起。各行各算活动字节 / 寄存器位置；
+  //   全被掩掉的行不访问 (m_ln 里那位为 0)，但元素照样算在这一次里
+  logic [VLW:0]   l_i   [VM_NL];                  // 各行第一个元素
+  logic [6:0]     l_n   [VM_NL];                  // 各行元素数 (不参与的行为 0)
+  logic [4:0]     l_r0  [VM_NL];
+  logic [6:0]     l_p0  [VM_NL];
+  logic [5:0]     l_off [VM_NL];
+  logic [63:0]    l_tact[VM_NL];
+  logic [VLW-1:0] l_fe  [VM_NL];
+  logic [63:0]    l_fa  [VM_NL];
+  logic [VM_NL-1:0] m_ln;                         // 本次访问的行
+  logic [8:0]     m_nt;                           // 本次的总元素数 (VM_NL = 4、e8 时最多 256)
   always_comb begin
-    for (int p = 0; p < VLB; p++) m_z[8*p +: 8] = (p >= int'(m_p0)) ? vrf[m_r0][8*p +: 8] : vrf[m_r1][8*p +: 8];
-    m_zr       = (m_z >> (8 * int'(m_p0))) | (m_z << (8 * (VLB - int'(m_p0))));
-    vm_wdata_o = 512'(m_zr) << (8 * int'(m_off));
-    vm_wmask_o = m_tact << m_off;
+    l_i[0] = (VLW+1)'(m_i); l_n[0] = m_n; l_r0[0] = m_r0; l_p0[0] = m_p0; l_off[0] = m_off;
+    l_tact[0] = m_tact; l_fe[0] = m_fe; l_fa[0] = m_fa;
+    m_ln = '0; m_ln[0] = m_any;
+    m_nt = 9'(m_n);
+    for (int j = 1; j < VM_NL; j++) begin
+      int          ii, nn, gb;
+      logic        el;
+      logic [63:0] win, ax;
+      ii = int'(m_i) + int'(m_n) + (j - 1) * (64 >> m_dw);
+      el = m_grp && !m_mis && (int'(m_ax[11:6]) + j <= 63) && (ii < int'(m_evl)) && (int'(m_n) << m_dw) + int'(m_off) == 64;
+      for (int k = 1; k < j; k++) if (l_n[k] == '0) el = 1'b0;   // 前面的行都满
+      nn = (64 >> m_dw);
+      if (ii + nn > int'(m_evl)) nn = int'(m_evl) - ii;
+      if (!el) nn = 0;
+      gb = ii << m_dw;
+      ax = {m_ax[63:6] + 58'(j), 6'd0};
+      l_i[j]   = (VLW+1)'(ii);
+      l_n[j]   = 7'(nn);
+      l_r0[j]  = md.vd + 5'(gb / VLB);
+      l_p0[j]  = 7'(gb % VLB);
+      l_off[j] = '0;
+      win = 64'(vrf[0] >> ii);
+      for (int t = 0; t < 64; t++) begin
+        logic ea;
+        unique case (m_dw)
+          2'd0:    ea = win[t];
+          2'd1:    ea = win[t >> 1];
+          2'd2:    ea = win[t >> 2];
+          default: ea = win[t >> 3];
+        endcase
+        l_tact[j][t] = (t < (nn << m_dw)) && (md.vm || ea);
+      end
+      l_fe[j] = VLW'(ii); l_fa[j] = ax;
+      if (|l_tact[j]) begin
+        logic [6:0] tz;
+        tz = clz64(brev64(l_tact[j]));
+        l_fe[j] = VLW'(ii) + VLW'(tz >> m_dw);
+        l_fa[j] = ax + 64'(tz);
+      end
+      m_ln[j] = |l_tact[j];
+      m_nt    = m_nt + 9'(nn);
+    end
   end
-  // 在途的行 (最多 2 个，按序回)：load 写回与出错时要用的 {r0, p0, 行内偏移, 字节使能, 第一个活动元素及地址}
+  wire m_bany = |m_ln;
+  // store：读 r0 / r1 拼成 128 字节，右旋 p0 字节成段顺序，再放到行内 off 处 (每行各一份)
+  always_comb
+    for (int j = 0; j < VM_NL; j++) begin
+      logic [VLEN-1:0] z, zr;
+      for (int p = 0; p < VLB; p++) z[8*p +: 8] = (p >= int'(l_p0[j])) ? vrf[l_r0[j]][8*p +: 8] : vrf[5'(l_r0[j] + 5'd1)][8*p +: 8];
+      zr            = (z >> (8 * int'(l_p0[j]))) | (z << (8 * (VLB - int'(l_p0[j]))));
+      vm_wdata_o[j] = 512'(zr) << (8 * int'(l_off[j]));
+      vm_wmask_o[j] = m_ln[j] ? (l_tact[j] << l_off[j]) : '0;
+    end
+  // 在途的访问 (最多 MQD 次，按序回)：load 写回与出错时要用的各行 {r0, p0, 行内偏移, 字节使能, 第一个活动元素及地址}
+  //   P2.1：LSU T / C / A + D$ 行口每拍一次，2 个在途不够背靠背，加到 8
   typedef struct packed {
     logic [4:0]     r0;
     logic [6:0]     p0;
@@ -2620,92 +3348,182 @@ module o6_vu
     logic [63:0]    tact;
     logic [VLW-1:0] fe;
     logic [63:0]    fa;
+  } ml_t;
+  typedef struct packed {
+    logic [VM_NL-1:0] ln;
+    ml_t [VM_NL-1:0]  l;
   } mq_t;
-  mq_t        mq [2];
-  logic       mq_h;
-  logic [1:0] mq_n;
+  localparam int MQD = 8;
+  mq_t        mq [MQD];
+  logic [2:0] mq_h;
+  logic [3:0] mq_n;
   mq_t        mqh;
+  mq_t        m_cur;                                     // 本次要进队的项
   assign mqh = mq[mq_h];
+  always_comb begin
+    m_cur.ln = m_ln;
+    for (int j = 0; j < VM_NL; j++) m_cur.l[j] = '{r0: l_r0[j], p0: l_p0[j], off: l_off[j], tact: l_tact[j], fe: l_fe[j], fa: l_fa[j]};
+  end
   // load：回来的行先寄存一拍 (P5：vm_rdata_i 是端口输入，原先当拍移位 / 旋转后直接写寄存器堆)，
   //   下一拍把数据移到段顺序，左旋 p0 字节到寄存器位置；字节使能分给 r0 (p >= p0) / r1 (p < p0，绕回部分)。
+  //   P3：一次的各行落在 R = 第 0 行的 r0 起的连续 3 个寄存器里 (窗口 p0 + 192 B < 3 x 128 B)，各行按字节合并后
+  //   C 口写 R、B 口写 R+1、D 口写 R+2 (各行字节不相交)。
   //   在途计数 / 出错仍按 vm_done_i 当拍算；写回晚一拍，访存结束 (m_fin) 要等这一拍写完
-  logic            mr_v;                                 // 寄存的那行本拍写寄存器堆
-  logic [511:0]    mr_d;
+  logic            mr_v;                                 // 寄存的那次本拍写寄存器堆
+  logic [511:0]    mr_d [VM_NL];
   mq_t             mr_q;
-  logic [VLEN-1:0] m_x;
-  logic [VLB-1:0]  m_we0, m_we1;
-  wire  [4:0]      m_wr0 = mr_q.r0;
-  wire  [4:0]      m_wr1 = mr_q.r0 + 5'd1;
+  logic [VM_NL-1:0] mr_ln;                               // 要写回的行 (出错时只有出错行之前的)
+  logic [VLEN-1:0] m_xd [3];                             // 写 R / R+1 / R+2 的数据
+  logic [VLB-1:0]  m_xe [3];                             // 及其字节使能
+  wire  [4:0]      m_wr0 = mr_q.l[0].r0;
+  logic            m_xov;                                // 有字节落到 R+2 之外 (不应发生，断言)
   always_comb begin
-    logic [VLEN-1:0] y;
-    logic [VLB-1:0]  ey, er;
-    y   = VLEN'(mr_d >> (8 * int'(mr_q.off)));
-    ey  = VLB'(mr_q.tact);
-    m_x = (y << (8 * int'(mr_q.p0))) | (y >> (8 * (VLB - int'(mr_q.p0))));
-    er  = (ey << mr_q.p0) | (ey >> (VLB - int'(mr_q.p0)));
-    for (int p = 0; p < VLB; p++) begin
-      m_we0[p] = er[p] && (p >= int'(mr_q.p0));
-      m_we1[p] = er[p] && (p <  int'(mr_q.p0));
+    for (int t = 0; t < 3; t++) begin m_xd[t] = '0; m_xe[t] = '0; end
+    m_xov = 1'b0;
+    for (int j = 0; j < VM_NL; j++) begin
+      logic [VLEN-1:0] y, x;
+      logic [VLB-1:0]  ey, er, e0, e1;
+      int              dj;
+      y  = VLEN'(mr_d[j] >> (8 * int'(mr_q.l[j].off)));
+      ey = mr_ln[j] ? VLB'(mr_q.l[j].tact) : '0;
+      x  = (y << (8 * int'(mr_q.l[j].p0))) | (y >> (8 * (VLB - int'(mr_q.l[j].p0))));
+      er = (ey << mr_q.l[j].p0) | (ey >> (VLB - int'(mr_q.l[j].p0)));
+      for (int p = 0; p < VLB; p++) begin
+        e0[p] = er[p] && (p >= int'(mr_q.l[j].p0));
+        e1[p] = er[p] && (p <  int'(mr_q.l[j].p0));
+      end
+      dj = int'(5'(mr_q.l[j].r0 - m_wr0));
+      if ((e0 != '0 && dj > 2) || (e1 != '0 && dj > 1)) m_xov = 1'b1;
+      for (int t = 0; t < 3; t++) begin
+        logic [VLB-1:0] e;
+        e = ((dj == t) ? e0 : '0) | ((dj + 1 == t) ? e1 : '0);
+        if ((m_xe[t] & e) != '0) m_xov = 1'b1;           // 各行字节应不相交
+        m_xd[t] = m_xd[t] | (x & b2bit(e));
+        m_xe[t] = m_xe[t] | e;
+      end
     end
   end
-  wire m_run = (rs == R_MEM) && !m_fin;
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i)
+    if (rst_ni && mr_v) assert (!m_xov) else $error("vecu: 向量 load 一次的各行写到 R .. R+2 之外或字节重叠");
+`endif
+  wire m_run = m_on && !m_fin;
   wire m_end = (int'(m_i) >= int'(m_evl));       // 全部发完
-  // 队头本拍完成也可补发 (LSU 向量口 T/C/A 三级，2 个在途要背靠背补上；满时同拍一进一出，新项写进弹出的那格)
-  assign vm_req_o   = m_run && !m_end && m_any && !m_mis && (mq_n < 2'd2 || vm_done_i);
-  assign vm_we_o    = rq.st;
+  // 队头本拍完成也可补发 (满时同拍一进一出，新项写进弹出的那格)
+  assign vm_req_o   = m_run && !m_end && m_bany && !m_mis && (mq_n < 4'(MQD) || vm_done_i);
+  assign vm_we_o    = md.st;
   assign vm_va_o    = m_fa;
+  assign vm_ln_o    = m_ln;
   wire m_push = vm_req_o && vm_ack_i;
+  // 突发 (P2.3，docs/11 §7)：按指令定每次访问的长度 —— 合并方式 (单位步长 / 整寄存器 / 掩码 / fault-only-first，不分段)
+  //   最多连续 4 行 (256 B) 一个突发，只有首行经 DTLB 翻译；逐个方式 (分段 / 跨步 / 索引) 每行 (64 B) 各自翻译。
+  //   后续行 = 紧接上一次发出的行、同一 4 KB 页、突发里还不到 4 行
+  localparam int MBURST = 4;
+  logic [57:0] mb_line;            // 上一次发出的行号 (va[63:6])
+  logic [1:0]  mb_n;               // 当前突发已发的行数 - 1
+  logic        mb_v;               // 本条指令已发过行
+  // P3：一次多行时 "上一行" = 上一次里编号最大的访问行 (与 LSU 的 vl_pa 一致)
+  wire  [57:0] m_line = m_fa[63:6];
+  logic [1:0]  m_lastl;
+  always_comb begin
+    m_lastl = '0;
+    for (int j = 0; j < VM_NL; j++) if (m_ln[j]) m_lastl = 2'(j);
+  end
+  assign vm_cont_o = m_grp && mb_v && m_line == mb_line + 58'd1 && m_line[5:0] != 6'd0 && int'(mb_n) < MBURST - 1;
+  always_ff @(posedge clk_i) begin
+    if (m_gox) mb_v <= 1'b0;
+    else if (m_push) begin
+      mb_v <= 1'b1; mb_line <= m_line + 58'(m_lastl);
+      mb_n <= vm_cont_o ? mb_n + 2'd1 : 2'd0;
+    end
+  end
   // 前进：全部被掩掉 (跳过整个元素 / 组，不访存) 或请求被收下；不对齐只对有活动元素的判 (Spike 也不查被掩掉的)
-  wire m_adv  = m_run && !m_end && (!m_any || m_push);
+  wire m_adv  = m_run && !m_end && (!m_bany || m_push);
   wire m_nxe  = !m_any || (4'(m_f) + 4'd1 >= m_nfe);   // 本次之后换到下一个元素 (组)
-  // 出错：LSU 报的 (在途队头，此时它是唯一在途的) / 不对齐 (等在途的都回来再报)
+  // 出错：LSU 报的 (在途队头；vm_flane 那行出错) / 不对齐 (等在途的都回来再报)
   wire m_lerr = m_run && vm_done_i && vm_fault_i;
-  wire m_merr = m_run && !m_end && m_any && m_mis && (mq_n == 2'd0);
+  wire m_merr = m_run && !m_end && m_any && m_mis && (mq_n == '0);
   wire m_err  = m_lerr || m_merr;
-  wire [VLW-1:0] m_efe = m_lerr ? mqh.fe : m_fe;
-  logic           m_trim;                        // fault-only-first：截短 vl
-  logic [VLW-1:0] m_fv;                          // 出错的元素
+  wire [VLW-1:0] m_efe = m_lerr ? mqh.l[vm_flane_i].fe : m_fe;
+  logic [VLW-1:0] m_fv;                          // 出错的元素 (m_trim 的声明在前面)
 
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (!rst_ni) begin
-      m_fin <= 1'b0; m_flt <= 1'b0; m_trim <= 1'b0; mq_h <= 1'b0; mq_n <= '0;
+      m_fin <= 1'b0; m_flt <= 1'b0; m_trim <= 1'b0; mq_h <= '0; mq_n <= '0; m_conf <= 1'b0; m_tail <= 1'b0;
     end else begin
-      if (rs == R_SYNC && drained && rq.k == K_VMEM) begin
-        m_fin <= 1'b0; m_flt <= 1'b0; m_trim <= 1'b0; mq_h <= 1'b0; mq_n <= '0;
-      end else if (m_run) begin
-        if (m_err) begin
-          m_fin <= 1'b1;
-          if (rq.mm == M_FF && m_efe != '0) m_trim <= 1'b1;  // 第 0 个元素之后出错：不陷入，vl = 该元素
-          else m_flt <= 1'b1;
-        end else if (m_end && mq_n == 2'd0 && !mr_v) m_fin <= 1'b1;
-        mq_n <= mq_n + 2'(m_push) - 2'(vm_done_i);
-        if (vm_done_i) mq_h <= !mq_h;
-      end else if (rs != R_MEM) m_fin <= 1'b0;
+      if (m_gox) begin
+        m_fin <= 1'b0; m_flt <= 1'b0; m_trim <= 1'b0; mq_h <= '0; mq_n <= '0; m_conf <= 1'b0;
+      end else begin
+        if (m_run) begin
+          if (vm_conf_i) m_conf <= 1'b1;
+          if (m_err) begin
+            m_fin <= 1'b1;
+            if (md.mm == M_FF && m_efe != '0) m_trim <= 1'b1;  // 第 0 个元素之后出错：不陷入，vl = 该元素
+            else m_flt <= 1'b1;
+          end else if ((m_end && mq_n == '0 && !mr_v) || m_early) m_fin <= 1'b1;
+        end else if (!m_on) m_fin <= 1'b0;
+        // 在途计数：执行中与提前应答后的写回期间都要跟
+        if (m_run || m_tail) begin
+          mq_n <= mq_n + 4'(m_push) - 4'(vm_done_i);
+          if (vm_done_i) mq_h <= mq_h + 3'd1;
+        end
+        // 写回期间：在途的行都回来、最后一行写完就结束
+        if (m_early)                                  m_tail <= 1'b1;
+        else if (m_tail && mq_n == '0 && !mr_v)       m_tail <= 1'b0;
+      end
     end
   end
+  // 提前应答 (P2.4b)：向量 load、所有元素都已发出 (或跳过)、LSU 的 T / C 都空 (在途的行都已过检查，不会再报错)、
+  //   本拍没有出错要报。剩下的只是数据回来写寄存器堆
+  assign m_early = m_run && !md.st && m_end && !m_err && vm_tce_i;
+  always_ff @(posedge clk_i)
+    if (m_gox) begin m_pw <= '0; m_ld <= !mnd.st; end
+    else if (m_push) m_pw <= m_pw | rgm(m_r0, (VM_NL > 1) ? 3 : 2);  // 这次写 r0 起 2 个 (多行时 3 个) 寄存器
   always_ff @(posedge clk_i) begin
-    if (rs == R_SYNC && drained && rq.k == K_VMEM) begin
+    if (m_gox) begin
       m_i <= VLW'(vstart); m_f <= '0;
-      m_a <= ra_q + 64'(vstart) * m_es;
+      m_a <= mn_a + 64'(vstart) * f_mes(mnd, mn_b);
     end else if (m_adv) begin
       if (m_nxe) begin
         m_f <= '0;
-        m_i <= m_i + VLW'(m_n);
-        m_a <= m_a + (m_grp ? (64'(m_n) << m_dw) : m_es);
+        m_i <= m_i + VLW'(m_nt);
+        m_a <= m_a + (m_grp ? (64'(m_nt) << m_dw) : m_es);
       end else m_f <= m_f + 1'b1;
     end
-    if (m_push) mq[mq_h ^ mq_n[0]] <= '{r0: m_r0, p0: m_p0, off: m_off, tact: m_tact, fe: m_fe, fa: m_fa};
+    // 新项写在队尾 (h + n)；满且同拍弹出时 h + n 正好是弹出的那格 (模 MQD)
+    if (m_push) mq[3'(mq_h + 3'(mq_n))] <= m_cur;
     if (m_err) begin
-      m_cause <= m_lerr ? vm_cause_i : (rq.st ? EXC_STORE_MISALIGN : EXC_LOAD_MISALIGN);
-      m_tval  <= m_lerr ? mqh.fa : m_fa;
+      m_cause <= m_lerr ? vm_cause_i : (md.st ? EXC_STORE_MISALIGN : EXC_LOAD_MISALIGN);
+      m_tval  <= m_lerr ? mqh.l[vm_flane_i].fa : m_fa;
       m_fv    <= m_efe;
     end
   end
+  // 写回：正常完成写全部访问行；出错时 vm_flane 之前的行已读到 (P3 截短)，照常写
+  logic [VM_NL-1:0] m_dln;
+  always_comb begin
+    m_dln = mqh.ln;
+    if (vm_fault_i) for (int j = 0; j < VM_NL; j++) if (j >= int'(vm_flane_i)) m_dln[j] = 1'b0;
+  end
   always_ff @(posedge clk_i or negedge rst_ni)
     if (!rst_ni) mr_v <= 1'b0;
-    else         mr_v <= m_run && !rq.st && vm_done_i && !vm_fault_i;
+    else         mr_v <= (m_run || m_tail) && m_ld && vm_done_i && m_dln != '0;
+`ifndef SYNTHESIS
+  // 提前应答后不会再有出错的行回来
+  always_ff @(posedge clk_i) if (rst_ni && m_tail) assert (!(vm_done_i && vm_fault_i)) else $error("vecu: 向量 load 提前应答后又报访存错误");
+  // I2a：异步 load 预查过 [基址, 基址 + VEL_SPAN)，不会出错 (页表在提交后被改且没有 sfence 才可能，按不支持处理)；
+  //   访问范围在预查范围内；同步请求不会与异步 load 同时在引擎里
   always_ff @(posedge clk_i)
-    if (vm_done_i) begin mr_d <= vm_rdata_i; mr_q <= mqh; end
+    if (rst_ni) begin
+      if (m_on && m_as) assert (!m_err) else $error("vecu: 提交后的异步向量 load %h 访存出错 (预查应已排除)", me_i);
+      if (m_on && m_as && m_push)
+        assert (m_fa >= me_a && m_fa - me_a < 64'(VEL_SPAN)) else $error("vecu: 异步向量 load 访问 %h 超出预查范围 (基址 %h)", m_fa, me_a);
+      if (m_on && m_as) assert (rs != R_MEM) else $error("vecu: 异步 load 与同步访存同时在引擎里");
+      assert (!(m_go && ma_go)) else $error("vecu: 同步访存与异步 load 同拍开始");
+      if (cv_lq) assert (!lq_full) else $error("vecu: 访存队列溢出");
+    end
+`endif
+  always_ff @(posedge clk_i)
+    if (vm_done_i) begin mr_d <= vm_rdata_i; mr_q <= mqh; mr_ln <= m_dln; end
   wire m_wr = mr_v;                                              // load 数据写回 (上一拍回来的那行)
 
   // 运算流水寄存器 (声明与说明见 c_dst 前)
@@ -2752,9 +3570,9 @@ module o6_vu
     if (p_out) begin
       s3_e0 <= p_e0[ANP-1]; s3_act <= p_act[ANP-1]; s3_dst <= c_dst; s3_cmp <= c_cmp;
       s3_sat <= |(c_sat & p_act[ANP-1]); s3_last <= p_last[ANP-1]; s3_red <= p_red[ANP-1];
-      s3_k <= p_wc[ANP-1].k; s3_vd <= p_wc[ANP-1].vd; s3_dw <= p_wc[ANP-1].dw;
+      s3_k <= p_wc[ANP-1].k; s3_vd <= p_wc[ANP-1].vd; s3_dw <= p_wc[ANP-1].dw; s3_wm <= p_wc[ANP-1].wm;
     end else if (s1_s3) begin
-      s3_k <= xd.k; s3_vd <= xd.vd; s3_dw <= xdw;
+      s3_k <= xd.k; s3_vd <= xd.vd; s3_dw <= xdw; s3_wm <= x_wm;
       s3_e0 <= e0_1; s3_act <= c_act1; s3_dst <= f_res2[xb[0]]; s3_cmp <= f_cmp2[xb[0]]; s3_sat <= 1'b0;
       s3_last <= (xb + 1'b1 >= xnb); s3_red <= f_fin;
       s3_pwe <= p_we; s3_pidx <= p_idx[12:0]; s3_pval <= p_val;
@@ -2790,8 +3608,8 @@ module o6_vu
     end else begin
       // 饱和类运算按元素累积 (执行期间；CSR 写只在排空后，不会同拍)
       if (s3_v && s3_k == K_EW && s3_sat) vxsat <= 1'b1;
-      if (rs == R_MEM && m_fin) begin
-      vstart <= m_flt ? LVLEN'(m_fv) : '0;             // 出错：从出错元素恢复；完成：清零
+      if (m_on && (m_fin || m_early)) begin             // 同步访存 (rs = R_MEM) 与异步 load (I2a) 都在这里结束
+      vstart <= m_flt ? LVLEN'(m_fv) : '0;             // 出错：从出错元素恢复；完成 / 提前应答 (不会再出错)：清零
       if (m_trim) vl <= m_fv;                          // fault-only-first：vl 截到出错元素
     end else if (do_sync) begin
       unique case (rq.k)
@@ -2844,23 +3662,36 @@ module o6_vu
     endcase
     return r;
   endfunction
-  logic            wa_v, wb_v;
-  logic [4:0]      wa_r, wb_r;
-  logic [VLEN-1:0] wa_d, wa_m, wb_d, wb_m;
+  // P2.4b：load 写回改走 C (r0) / B (r1) 口，执行流水独占 A 口 —— 异步 load 写回期间执行流水可同时写别的寄存器
+  //   (计分板保证两边写的寄存器不相交，断言)
+  // P3：load 一次多行，写 R / R+1 / R+2 三个寄存器 (C / B / D 口)
+  logic            wa_v, wb_v, wc_v, wd_v, we_v;
+  logic [4:0]      wa_r, wb_r, wc_r, wd_r, we_r;
+  logic [VLEN-1:0] wa_d, wa_m, wb_d, wb_m, wc_d, wc_m, wd_d, wd_m, we_d, we_m;
   wire             x_wr = s3_v;
-  logic [31:0]     wa_hit, wb_hit;                          // 各寄存器被 A / B 口写 (译码一次，位循环里共用)
+  logic [31:0]     wa_hit, wb_hit, wc_hit, wd_hit, we_hit;  // 各寄存器被 A / B / C / D / E 口写 (译码一次，位循环里共用)
   always_comb
     for (int r = 0; r < 32; r++) begin
       wa_hit[r] = wa_v && wa_r == 5'(r);
       wb_hit[r] = wb_v && wb_r == 5'(r);
+      wc_hit[r] = wc_v && wc_r == 5'(r);
+      wd_hit[r] = wd_v && wd_r == 5'(r);
+      we_hit[r] = we_v && we_r == 5'(r);
     end
+  // E 口 (I1.3a)：浮点快车道的结果 (槽 fr_s 的寄存器 / 块)
+  always_comb begin
+    we_v = fr_v; we_r = sl[fr_s].r;
+    for (int k = 0; k < VLEN / DLEN; k++) begin
+      we_d[DLEN*k +: DLEN] = fr_d;
+      we_m[DLEN*k +: DLEN] = (k == int'(sl[fr_s].blk)) ? fr_m : '0;
+    end
+  end
   wire             x_last = s3_last;
   always_comb begin
     wa_v = 1'b0; wa_r = s3_vd; wa_d = '0; wa_m = '0;
-    wb_v = m_wr; wb_r = m_wr1; wb_d = m_x; wb_m = b2bit(m_we1);
-    if (m_wr) begin
-      wa_v = 1'b1; wa_r = m_wr0; wa_d = m_x; wa_m = b2bit(m_we0);
-    end
+    wc_v = m_wr && m_xe[0] != '0; wc_r = m_wr0;         wc_d = m_xd[0]; wc_m = b2bit(m_xe[0]);
+    wb_v = m_wr && m_xe[1] != '0; wb_r = m_wr0 + 5'd1;  wb_d = m_xd[1]; wb_m = b2bit(m_xe[1]);
+    wd_v = m_wr && m_xe[2] != '0; wd_r = m_wr0 + 5'd2;  wd_d = m_xd[2]; wd_m = b2bit(m_xe[2]);
     if (x_wr) begin
       unique case (s3_k)
         K_EW, K_VIOTA, K_VMVNR, K_FEW: begin                 // 目的切片在 d_reg 的第 d_blk 个 DLEN 块内
@@ -2895,36 +3726,647 @@ module o6_vu
       endcase
     end
   end
+  //--------------------------------------------------------------------------
+  // 快路径执行器 (docs/11 §9a，I1.2)：一拍算完整个寄存器 (行为级参考实现；I1.3 换成按物理号读写的流水 V0)。
+  //   单宽度整数逐元素运算，LMUL <= 1，vstart = 0。体内 (i < vl) 活动元素写结果；vmerge / vmv.v 写全部体内元素；
+  //   其余 (被屏蔽、尾部) 保持 vd 原值 (与 o6_vecu 原执行流水一致：不按 agnostic 置 1)
+  //--------------------------------------------------------------------------
+  function automatic logic [63:0] fx_el(input logic [5:0] f6, input logic [63:0] a, input logic [63:0] b, input int w);
+    logic [63:0] m, sa, sb, r;
+    int          sh;
+    m  = (w == 64) ? '1 : ((64'd1 << w) - 64'd1);
+    sa = $signed(a << (64 - w)) >>> (64 - w);
+    sb = $signed(b << (64 - w)) >>> (64 - w);
+    sh = int'(b & 64'(w - 1));
+    unique case (f6)
+      6'b000000: r = a + b;                                          // vadd
+      6'b000010: r = a - b;                                          // vsub
+      6'b000011: r = b - a;                                          // vrsub
+      6'b000100: r = (a < b) ? a : b;                                // vminu
+      6'b000101: r = ($signed(sa) < $signed(sb)) ? a : b;            // vmin
+      6'b000110: r = (a > b) ? a : b;                                // vmaxu
+      6'b000111: r = ($signed(sa) > $signed(sb)) ? a : b;            // vmax
+      6'b001001: r = a & b;
+      6'b001010: r = a | b;
+      6'b001011: r = a ^ b;
+      6'b100101: r = a << sh;                                        // vsll
+      6'b101000: r = a >> sh;                                        // vsrl
+      6'b101001: r = $signed(sa) >>> sh;                             // vsra
+      default:   r = b;                                              // vmerge / vmv.v (选择在外面)
+    endcase
+    return r & m;
+  endfunction
+  function automatic logic [VLEN-1:0] fx_calc(input logic [31:0] ins, input logic [63:0] xs,
+                                              input logic [VLEN-1:0] v2, input logic [VLEN-1:0] v1,
+                                              input logic [VLEN-1:0] v0, input logic [VLEN-1:0] vo,
+                                              input logic [1:0] sw, input logic [VLW-1:0] vlv);
+    logic [VLEN-1:0] r;
+    logic [5:0]      f6;
+    logic [2:0]      f3;
+    logic [63:0]     bs;
+    logic            shf, mrg;
+    int              w, nel;
+    f6  = ins[31:26]; f3 = ins[14:12];
+    w   = 8 << sw; nel = VLEN / w;
+    shf = (f6 == 6'b100101) || (f6 == 6'b101000) || (f6 == 6'b101001);
+    mrg = (f6 == 6'b010111);
+    bs  = (f3 == 3'b100) ? xs : shf ? 64'(ins[19:15]) : {{59{ins[19]}}, ins[19:15]};   // .vx / .vi (移位用 uimm5)
+    r   = vo;
+    for (int e = 0; e < VLEN / 8; e++)
+      if (e < nel && e < int'(vlv)) begin
+        logic [63:0] a, b, m, x;
+        logic        act;
+        m = (w == 64) ? '1 : ((64'd1 << w) - 64'd1);
+        unique case (sw)
+          2'd0:    begin a = 64'(v2[8*e +: 8]);   b = 64'(v1[8*e +: 8]);   end
+          2'd1:    begin a = 64'(v2[16*e +: 16]); b = 64'(v1[16*e +: 16]); end
+          2'd2:    begin a = 64'(v2[32*e +: 32]); b = 64'(v1[32*e +: 32]); end
+          default: begin a = v2[64*e +: 64];      b = v1[64*e +: 64];      end
+        endcase
+        if (f3 != 3'b000) b = bs & m;
+        act = ins[25] || v0[e] || mrg;
+        x = (mrg && !ins[25] && !v0[e]) ? a : fx_el(f6, a, b, w);
+        if (act)
+          unique case (sw)
+            2'd0:    r[8*e +: 8]   = x[7:0];
+            2'd1:    r[16*e +: 16] = x[15:0];
+            2'd2:    r[32*e +: 32] = x[31:0];
+            default: r[64*e +: 64] = x;
+          endcase
+      end
+    return r;
+  endfunction
+
+  //--------------------------------------------------------------------------
+  // I2b / I2c 改名 (docs/11 §9e)：
+  //   开始 (ma_gor)：从空闲 FIFO 取 n 个物理寄存器给目的组 vd .. vd+n-1，记进改名 FIFO 的尾项；load 的 B / C / D 写口
+  //     按 wmap 写它们，各寄存器写到的字节记在该项的 rq_wm。rq_qold = 开始时 q 里比它老的条数，这些老指令照旧按 crat
+  //     读写旧的物理寄存器。I2c：最多 RNQ 项在途，引擎做完一条 (写回结束) 就能开始下一条
+  //   切换 (rn_sw，FIFO 头项、按程序序)：它的 load 写完 (不是引擎里正在做 / 写回的那条)、比它老的都已离开 q (qold = 0)，
+  //     在执行 / S2 的 (只可能是老的) 不读写目的组，运算流水 / 快车道 / 本拍 A、E 口都不写目的组 (老的写都已落在旧的
+  //     物理寄存器)。那拍：没被 load 写到的字节从旧的物理寄存器补过来 (undisturbed / vstart 之前 / 尾部)，crat 指向新的，
+  //     旧的回空闲 FIFO。同一架构寄存器连着两次改名 (gemm 的 v0) 按序切换：第二次补字节时 crat 已是第一次的新寄存器
+  //   碰到某项目的组、又比那条 load 年轻的指令在它切换前不开始 (x_start 的 rq_blk)，所以切换后它们读写的都是新的
+  //--------------------------------------------------------------------------
+  // O1 (docs/11 §9f)：
+  //   乱序 uop 的切换标记 (mk_go：lq 头是标记、改名 FIFO 尾项空) 进改名 FIFO：目的组 = {vd}、新物理寄存器 = 它的 pd (核内池，
+  //     VX 已写好整个寄存器，rq_wm 全 1 不补字节)，之后同 load 一样按序切换 (等更老的读完 / 写完)。
+  //   切换掉的旧物理寄存器按号码回池：VECU 池的回 fr_q，核内池的进 cf_q，每拍至多 2 个经 vfr 送回重命名的空闲表
+  //   (cf_q 剩不够 8 个空位时不切换)
+  logic [VLB-1:0]    rq_wm [RNQ][8];                      // 各项各目的寄存器被 load 写到的字节
+  localparam int CFN = 64;                               // V5：16 -> 64 (快路径一拍至多回收 NVC × 8 个)
+  localparam int CFW = $clog2(CFN);
+  preg_t             cf_q [CFN];
+  logic [CFW-1:0]    cf_h, cf_t;
+  logic [CFW:0]      cf_n;
+  assign mk_go = (lq_n != '0) && lq_mk[lq_h] && !rq_v[rq_t] && mf_n == '0;
+  for (genvar k = 0; k < W; k++) begin : g_vfr
+    assign vfr_v_o[k] = cf_n >= (CFW+1)'(k + 1);
+    assign vfr_p_o[k] = cf_q[cf_h + CFW'(k)];
+  end
+  function automatic logic [FRW-1:0] fr_add(input logic [FRW-1:0] p, input int k);
+    int s;
+    s = int'(p) + k;
+    return FRW'((s >= NFR) ? s - NFR : s);
+  endfunction
+  // 头项的字段 (切换用)
+  logic [4:0]  sh_vd;
+  logic [3:0]  sh_nn;
+  logic [31:0] sh_grp;
+  always_comb begin
+    sh_vd = rq_vd[rq_h]; sh_nn = rq_nn[rq_h]; sh_grp = rq_grp[rq_h];
+  end
+  wire   e_busy = m_rn && (m_on || m_tail);            // 引擎里有改了名的 load 在做 / 写回 (rq 的 e_ri 项)
+  // 在执行的指令本拍是最后一次读源 (快车道：最后一拍发出，切片上拍已读；其余：最后一拍完成)：本拍读的仍是切换前的映射，
+  //   切换可以同拍 (crat 拍沿才改)；它还要写目的组时照样等 (写在之后)
+  wire   x_lrd  = x_ffend || (x_busy && !x_ff && x_bdone && xb + 1'b1 >= xnb);
+  // V1.2d (vrand 9808)：乱序标记到 rq 头时，访存引擎里可能还有比它老的异步 load (标记只在 lq 头才进 rq，更老的 load
+  //   都已进引擎)。那条在写回期间一直按 crat 读 v0 (掩码) / 写目的组，与标记的组相交就要等它做完再切换
+  //   (原来：更年轻的乱序 vle32 v0 先切换，更老的带掩码 vlseg2 拿新 v0 当掩码)
+  wire   rn_eng = rq_mk[rq_h] && (m_on || m_tail) && (me_rset & sh_grp) != '0;
+  assign rn_sw = rq_v[rq_h] && !(e_busy && e_ri == rq_h) && (rq_qold[rq_h] == '0) && !rn_eng &&
+                 !((x_busy || s2_v) && (x_wm & sh_grp) != '0) &&
+                 !(x_busy && !x_lrd && (x_rd & sh_grp) != '0) &&
+                 ((p_wr | ff_wr) & sh_grp) == '0 &&
+                 !(wa_v && sh_grp[wa_r]) && !(we_v && sh_grp[we_r]) &&
+                 (cf_n <= (CFW+1)'(CFN - 8));
+  // V5 快路径：改名 FIFO 空时，lq 头连续的切换标记 (至多 NVC 个) 若与原路径没有冲突 (比它老的 q 都已开始、执行流水 /
+  //   访存引擎不再读写它的组) 就本拍直接切换 crat，旧物理寄存器同拍回收；不行时仍走原来的 mk_go (进 rq，一拍一个)
+  //   同一拍里后面的标记写同一寄存器时，它要回收的是前面那个标记的新物理寄存器 (按序逐个算)
+  logic [6:0] mf_nr;                                    // 快路径本拍回收的个数
+  always_comb begin
+    logic ok;
+    int   nr;
+    mf_n = '0; mf_nr = '0; ok = (rq_v == '0); nr = 0;
+    for (int j = 0; j < NVC; j++) begin
+      logic [LQW-1:0] i;
+      logic [31:0]    g;
+      i = lq_h + LQW'(j);
+      g = rgm(lq_vd[i], int'(lq_ng[i]));
+      ok = ok && ((LQW+1)'(j) < lq_n) && lq_mk[i] && (lq_qold[i] == '0) &&
+           !((m_on || m_tail) && (me_rset & g) != '0) &&
+           !((x_busy || s2_v) && (x_wm & g) != '0) &&
+           !(x_busy && !x_lrd && (x_rd & g) != '0) &&
+           ((p_wr | ff_wr) & g) == '0 &&
+           !(wa_v && g[wa_r]) && !(we_v && g[we_r]) &&
+           (int'(cf_n) + nr + int'(lq_ng[i]) <= CFN);
+      if (ok) begin mf_n = 3'(j + 1); nr = nr + int'(lq_ng[i]); end
+    end
+    mf_nr = 7'(nr);
+  end
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      rq_v <= '0; rq_h <= '0; rq_t <= '0; m_rn <= 1'b0; e_qold <= '0;
+      fr_h <= '0; fr_t <= '0; fr_n <= (FRW+1)'(NFR);
+      for (int i = 0; i < NFR; i++) fr_q[i] <= PREG_W'(VCP + i);
+      cf_h <= '0; cf_t <= '0; cf_n <= '0;
+    end else begin
+      int nv, nc, npop;
+      if (m_gox) begin
+        e_qold <= ma_gor ? lq_qold[lq_h] - ($clog2(QD)+1)'(x_start && lq_qold[lq_h] != '0) : '0;
+        m_rn   <= ma_gor;
+      end else if (x_start && e_qold != '0) e_qold <= e_qold - 1'b1;
+      if (ma_gor || mk_go) begin
+        rq_v[rq_t] <= 1'b1;
+        rq_t       <= rq_t + 1'b1;
+      end
+      if (ma_gor) fr_h <= fr_add(fr_h, int'(lq_rn));
+      // 切换：旧的按池回收
+      nv = 0; nc = 0;
+      if (rn_sw) begin
+        rq_v[rq_h] <= 1'b0;
+        rq_h       <= rq_h + 1'b1;
+        for (int k = 0; k < 8; k++)
+          if (k < int'(sh_nn)) begin
+            preg_t o;
+            o = crat[sh_vd + 5'(k)];
+            if (o >= preg_t'(VCP)) begin fr_q[fr_add(fr_t, nv)] <= o; nv++; end
+            else                     begin cf_q[cf_t + CFW'(nc)] <= o; nc++; end
+          end
+        fr_t <= fr_add(fr_t, nv);
+      end
+      // V5 快路径的回收 (与 rn_sw 不同拍：快路径要求 rq 空)
+      if (mf_n != '0) begin
+        preg_t tc [32];
+        for (int r = 0; r < 32; r++) tc[r] = crat[r];
+        for (int j = 0; j < NVC; j++)
+          if (3'(j) < mf_n) begin
+            logic [LQW-1:0] i;
+            i = lq_h + LQW'(j);
+            for (int k = 0; k < 8; k++)
+              if (k < int'(lq_ng[i])) begin
+                preg_t o;
+                o = tc[lq_vd[i] + 5'(k)];
+                if (o >= preg_t'(VCP)) begin fr_q[fr_add(fr_t, nv)] <= o; nv++; end
+                else                     begin cf_q[cf_t + CFW'(nc)] <= o; nc++; end
+                tc[lq_vd[i] + 5'(k)] = lq_pg[i][k];
+              end
+          end
+        fr_t <= fr_add(fr_t, nv);
+      end
+      fr_n <= fr_n - (ma_gor ? (FRW+1)'(lq_rn) : '0) + (FRW+1)'(nv);
+      npop = (cf_n >= 5'(W)) ? W : int'(cf_n);
+      cf_t <= cf_t + CFW'(nc);
+      cf_h <= cf_h + CFW'(npop);
+      cf_n <= cf_n + (CFW+1)'(nc) - (CFW+1)'(npop);
+    end
+  end
+  always_ff @(posedge clk_i) begin
+    // 各项的 qold 随 q 出队递减；新项的 qold 扣掉本拍出队的那条 (若它比 load 老)
+    for (int j = 0; j < RNQ; j++)
+      if (x_start && rq_qold[j] != '0) rq_qold[j] <= rq_qold[j] - 1'b1;
+    if (ma_gor) begin
+      e_ri <= rq_t;
+      rq_vd[rq_t]   <= lqd.vd; rq_nn[rq_t] <= lq_rn; rq_mk[rq_t] <= 1'b0;
+      rq_grp[rq_t]  <= rgm(lqd.vd, int'(lq_rn));
+      rq_qold[rq_t] <= lq_qold[lq_h] - ($clog2(QD)+1)'(x_start && lq_qold[lq_h] != '0);
+      for (int k = 0; k < 8; k++) begin rq_p[rq_t][k] <= fr_q[fr_add(fr_h, k)]; rq_wm[rq_t][k] <= '0; end
+    end else if (mk_go) begin
+      rq_vd[rq_t]   <= lq_vd[lq_h]; rq_nn[rq_t] <= lq_ng[lq_h]; rq_mk[rq_t] <= 1'b1;   // V1.2b：整组切换
+      rq_grp[rq_t]  <= rgm(lq_vd[lq_h], int'(lq_ng[lq_h]));
+      rq_qold[rq_t] <= lq_qold[lq_h] - ($clog2(QD)+1)'(x_start && lq_qold[lq_h] != '0);
+      for (int k = 0; k < 8; k++) begin rq_p[rq_t][k] <= lq_pg[lq_h][k]; rq_wm[rq_t][k] <= '1; end
+    end
+    if (e_busy && m_wr)
+      for (int t = 0; t < 3; t++) begin
+        logic [4:0] k;
+        k = 5'(m_wr0 + 5'(t)) - rq_vd[e_ri];
+        if (k < 5'(rq_nn[e_ri])) rq_wm[e_ri][k[2:0]] <= rq_wm[e_ri][k[2:0]] | m_xe[t];
+      end
+  end
+  // load 写口 (B / C / D) 的目的物理寄存器：引擎里的 load 改了名时它的目的组写新的，其余照 crat (逐个连续赋值，同 vrf 视图)
+  preg_t       wmap [32];
+  logic [4:0]  ew_vd;
+  logic [3:0]  ew_nn;
+  always_comb begin ew_vd = rq_vd[e_ri]; ew_nn = rq_nn[e_ri]; end
+  for (genvar r = 0; r < 32; r++) begin : g_wmap
+    wire [4:0] dk = 5'(r) - ew_vd;
+    assign wmap[r] = (e_busy && dk < 5'(ew_nn)) ? rq_p[e_ri][dk[2:0]] : crat[r];
+  end
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i)
+    if (rst_ni) begin
+      int nin, nmap;
+      nin = 0; nmap = 0;
+      for (int j = 0; j < RNQ; j++) if (rq_v[j] && !rq_mk[j]) nin += int'(rq_nn[j]);
+      for (int r = 0; r < 32; r++) if (crat[r] >= preg_t'(VCP)) nmap++;
+      // VECU 池守恒 (O1)：被 crat 映射的 + 改名在途的 (load 的新寄存器) + 空闲的 = VNP
+      assert (nmap + int'(fr_n) + nin == NFR)
+        else $error("vecu: VECU 池物理寄存器数不守恒 (映射 %0d、空闲 %0d、改名在途 %0d)", nmap, fr_n, nin);
+      assert (cf_n <= (CFW+1)'(CFN)) else $error("vecu: 回收队列 cf_q 溢出");
+      if (e_busy) assert (rq_v[e_ri] && !rq_mk[e_ri]) else $error("vecu: 引擎里改名的 load 的改名项无效");
+      if (mk_go)
+        for (int k = 0; k < 8; k++)
+          if (k < int'(lq_ng[lq_h]))
+            for (int r = 0; r < 32; r++)
+              assert (crat[r] != lq_pg[lq_h][k]) else $error("vecu: 切换标记的 p%0d 仍被 v%0d 映射", lq_pg[lq_h][k], r);
+      if (ma_gor)
+        for (int k = 0; k < 8; k++)
+          if (k < int'(lq_rn))
+            for (int r = 0; r < 32; r++)
+              assert (crat[r] != fr_q[fr_add(fr_h, k)]) else $error("vecu: 改名分到的 p%0d 仍被 v%0d 映射", fr_q[fr_add(fr_h, k)], r);
+    end
+`endif
+
+  //--------------------------------------------------------------------------
+  // VX (docs/11 §9h)：VIQ 发射来的乱序运算指令进 NVX 个 o6_vex (全流水、固定延迟)；store 数据 uop 走单独的两级 (X0 读、X1 送 SQ)。
+  //   读源：cr 的按 crat (重命名时已确认最近写它的指令做完)，其余按物理号。
+  //   运算：读出的源当拍送 o6_vex (它自己在入口寄存)，XL 拍后出结果：写 vprf[pd]、清忙、最后一拍报完成 (带 fflags，
+  //     提交时同 FPU 簇并进 fcsr)。o6_vex 不看分支：外面一串同深度的影子级记 br_mask，误预测 / 冲刷的拍出来时丢弃。
+  //   pd 是核内池里刚分配的，不被 crat 映射、不在改名 FIFO 里 (它提交后才切换，而提交要等这里报完成)
+  //--------------------------------------------------------------------------
+  // store 数据 uop (两级)
+  logic            x1_v;
+  logic [31:0]     x1_raw;
+  logic [VLEN-1:0] x1_s [4];
+  rob_ptr_t        x1_rob;
+  br_mask_t        x1_bm;
+  sq_ptr_t         x1_sq;
+  logic [2:0]      x1_vk;
+  logic [VLEN-1:0] x0_s [4];
+  always_comb
+    for (int k = 0; k < 4; k++)
+      x0_s[k] = !vs_src_i[k].use_ ? '0 : vs_src_i[k].cr ? vprf[crat[vs_src_i[k].ar]] : vprf[vs_src_i[k].p];
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) x1_v <= 1'b0;
+    else         x1_v <= vs_v_i && !flush_i && !br_killed(vs_bm_i, br_upd_i);
+  always_ff @(posedge clk_i)
+    if (vs_v_i) begin
+      x1_raw <= vs_raw_i; x1_rob <= vs_rob_i; x1_bm <= br_mask_upd(vs_bm_i, br_upd_i);
+      x1_sq <= vs_sq_i; x1_vk <= vs_vk_i;
+      for (int k = 0; k < 4; k++) x1_s[k] <= x0_s[k];
+    end
+  wire x1_ok = x1_v && !flush_i && !br_killed(x1_bm, br_upd_i);
+  assign vsd_v_o   = x1_ok;
+  assign vsd_sq_o  = x1_sq;
+  assign vsd_rob_o = x1_rob;
+  assign vsd_d_o   = CL_W'(x1_s[2]);
+  assign vsd_bm_o  = x1_raw[25] ? '1 : vmbytes(x1_s[3], x1_vk, (x1_raw[14:12] == 3'b000) ? 2'd0 : x1_raw[13:12]);
+
+  // 运算：每个执行器一个序列器 + o6_vex。整条发射 —— 发射那拍送第 0 拍；组大小 ng > 1 时序列器锁存这一条，之后逐拍送下一个
+  //   寄存器，送完前 vx_rdy_o[e] = 0。第 k 拍：源 = 组里第 k 个寄存器 (sg[源][k])，掩码 = v0 里属于第 k 个寄存器的元素，
+  //   体内元素数 = clamp(vl − k × E, 0, E) (E = 128 >> SEW)，目的 = pg[k]。每拍写回清它那个寄存器的忙；
+  //   最后一拍报完成 (fflags = 各拍之或)。误预测 / 冲刷时序列器停 (剩下的拍不送)。
+  //   V3 链式：第 k (>= 1) 拍的源 (不按 crat 的) 还忙时停一拍 (VIQ 只保证第 0 拍的源已写好、其余的生产者已发射)
+  localparam int XL = 7;                                  // o6_vex 从送入到出结果的拍数 (入口寄存 1 + fpnew 5 + 输出对齐 1)
+  localparam int XTW = $bits(preg_t) + $bits(rob_ptr_t) + 2;
+  logic [NVX-1:0]  xe_ok;                                 // 各执行器本拍写回
+  preg_t           xe_pd  [NVX];
+  logic [VLEN-1:0] xe_od  [NVX];
+  logic [4:0]      xe_off [NVX];
+  logic [31:0]     xe_raw [NVX];                          // 调试打印用
+  logic [NVX-1:0]  x_new_v, sq_vv;
+  for (genvar x = 0; x < NVX; x++) begin : g_vx
+    logic             sq_v;                               // 序列器在送 (第 sq_k 拍)
+    logic [2:0]       sq_k;
+    logic [31:0]      sq_raw;
+    logic [1:0]       sq_sew;
+    logic [10:0]      sq_vl;
+    logic [3:0]       sq_ns;                              // V4：拍数 = 源组寄存器数 (点积的目的只有 1 个)
+    logic [2:0]       sq_lm;
+    logic             sq_alt;
+    vsrc_t [2:0][7:0] sq_sg;
+    vsrc_t            sq_v0;
+    logic [63:0]      sq_xs;
+    preg_t [7:0]      sq_pg;
+    rob_ptr_t         sq_rob;
+    br_mask_t         sq_bm;
+    logic             d_blk, d_rdy;                       // V4：点积单元 XL 拍后要写回 / 有空的 A 缓冲
+    wire  sq_ok  = sq_v && !flush_i && !br_killed(sq_bm, br_upd_i);
+    wire  x_new  = vx_v_i[x] && !flush_i && !br_killed(vx_bm_i[x], br_upd_i);
+    assign vx_rdy_o[x] = !sq_v && !d_blk;
+    assign vx_dok_o[x] = d_rdy;
+    assign x_new_v[x]  = x_new;
+    assign sq_vv[x]    = sq_v;
+    // 本拍送出的这一拍 (运算进 o6_vex，点积进 o6_vdot)
+    logic             xb_v, xb_first, xb_last, xb_rdy, xb_dot;
+    logic [2:0]       xb_k;
+    logic [31:0]      xb_raw;
+    logic [1:0]       xb_sew;
+    logic [10:0]      xb_vl;
+    logic [2:0]       xb_lm;
+    logic             xb_alt;
+    vsrc_t [2:0]      xb_s;
+    vsrc_t            xb_v0;
+    logic [63:0]      xb_xs;
+    preg_t            xb_pd;
+    rob_ptr_t         xb_rob;
+    br_mask_t         xb_bm;
+    always_comb begin
+      if (sq_v) begin
+        xb_k = sq_k; xb_raw = sq_raw; xb_sew = sq_sew; xb_vl = sq_vl; xb_v0 = sq_v0; xb_xs = sq_xs;
+        xb_lm = sq_lm; xb_alt = sq_alt;
+        for (int s = 0; s < 3; s++) xb_s[s] = sq_sg[s][sq_k];
+        xb_pd = sq_pg[sq_k]; xb_rob = sq_rob; xb_bm = br_mask_upd(sq_bm, br_upd_i);
+        xb_first = 1'b0; xb_last = (4'(sq_k) + 4'd1 >= sq_ns);
+        xb_dot = vdot_op(sq_raw);
+        xb_rdy = !(d_blk && !xb_dot);                     // 点积单元 XL 拍后写回：这拍不往 o6_vex 送
+        for (int s = 0; s < 3; s++)
+          if (xb_s[s].use_ && !xb_s[s].cr && vbusy_i[xb_s[s].p]) xb_rdy = 1'b0;
+        xb_v = sq_ok && xb_rdy;
+      end else begin
+        xb_k = '0; xb_raw = vx_raw_i[x]; xb_sew = vx_sew_i[x]; xb_vl = vx_vl_i[x]; xb_v0 = vx_v0_i[x]; xb_xs = vx_xs_i[x];
+        xb_lm = vx_lm_i[x]; xb_alt = vx_alt_i[x];
+        for (int s = 0; s < 3; s++) xb_s[s] = vx_sg_i[x][s][0];
+        xb_pd = vx_pg_i[x][0]; xb_rob = vx_rob_i[x]; xb_bm = br_mask_upd(vx_bm_i[x], br_upd_i);
+        xb_first = 1'b1; xb_last = (vx_ns_i[x] <= 4'd1);
+        xb_dot = vdot_op(vx_raw_i[x]);
+        xb_rdy = 1'b1;
+        xb_v = x_new;
+      end
+    end
+    always_ff @(posedge clk_i or negedge rst_ni)
+      if (!rst_ni) begin sq_v <= 1'b0; sq_k <= '0; end
+      else if (sq_v) begin
+        if (!sq_ok) sq_v <= 1'b0;
+        else if (xb_rdy) begin
+          if (xb_last) sq_v <= 1'b0;
+          sq_k <= sq_k + 3'd1;
+        end
+      end else if (x_new && vx_ns_i[x] > 4'd1) begin
+        sq_v <= 1'b1; sq_k <= 3'd1;
+      end
+    always_ff @(posedge clk_i) begin
+      if (!sq_v && x_new) begin
+        sq_raw <= vx_raw_i[x]; sq_sew <= vx_sew_i[x]; sq_vl <= vx_vl_i[x]; sq_ns <= vx_ns_i[x]; sq_sg <= vx_sg_i[x];
+        sq_lm <= vx_lm_i[x]; sq_alt <= vx_alt_i[x];
+        sq_v0 <= vx_v0_i[x]; sq_xs <= vx_xs_i[x]; sq_pg <= vx_pg_i[x]; sq_rob <= vx_rob_i[x];
+      end
+      sq_bm <= (!sq_v && x_new) ? br_mask_upd(vx_bm_i[x], br_upd_i) : br_mask_upd(sq_bm, br_upd_i);
+    end
+    // 这一拍的操作数
+    logic [VLEN-1:0] xb_d [3];
+    logic [VLEN-1:0] xb_m0;
+    logic [7:0]      xb_nel;
+    logic [CL_B-1:0] xb_m, xb_act;
+    always_comb begin
+      int e, base, rem;
+      for (int s = 0; s < 3; s++)
+        xb_d[s] = !xb_s[s].use_ ? '0 : xb_s[s].cr ? vprf[crat[xb_s[s].ar]] : vprf[xb_s[s].p];
+      xb_m0 = !xb_v0.use_ ? '0 : xb_v0.cr ? vprf[crat[xb_v0.ar]] : vprf[xb_v0.p];
+      e    = CL_B >> xb_sew;                                // 每个寄存器的元素数
+      base = int'(xb_k) * e;
+      rem  = int'(xb_vl) - base;
+      xb_nel = 8'((rem <= 0) ? 0 : (rem >= e) ? e : rem);
+      xb_m   = CL_B'(xb_m0 >> base);
+      for (int i = 0; i < CL_B; i++) xb_act[i] = (i < int'(xb_nel)) && (xb_raw[25] || xb_m[i]);
+    end
+    wire xb_vx = xb_v && !xb_dot;
+    logic            o_v;
+    logic [XTW-1:0]  o_tag;
+    logic [VLEN-1:0] o_d;
+    logic [4:0]      o_ff;
+    o6_vex #(.TW(XTW)) u_vex (
+      .clk_i, .rst_ni,
+      .in_v_i(xb_vx), .in_raw_i(xb_raw), .in_sew_i(xb_sew), .in_nel_i(xb_nel), .in_m_i(xb_m),
+      .in_vs2_i(xb_d[0]), .in_vs1_i(xb_d[1]), .in_vd_i(xb_d[2]), .in_xs_i(xb_xs), .in_frm_i(frm_i),
+      .in_tag_i({xb_pd, xb_rob, xb_first, xb_last}),
+      .out_v_o(o_v), .out_d_o(o_d), .out_tag_o(o_tag), .out_ff_o(o_ff)
+    );
+    // V4 点积单元 (结果写 vd 一个寄存器 = 第 0 拍的 pd)
+    localparam int DTW = $bits(preg_t) + $bits(rob_ptr_t) + 32;
+    logic            dv;
+    logic [VLEN-1:0] dd;
+    logic [DTW-1:0]  dtag;
+    logic [4:0]      dff;
+    vsrc_t           drd;
+    logic [VLEN-1:0] drd_d;
+    assign drd_d = !drd.use_ ? '0 : drd.cr ? vprf[crat[drd.ar]] : vprf[drd.p];
+    o6_vdot #(.TW(DTW), .XL(XL)) u_vdot (
+      .clk_i, .rst_ni, .flush_i, .br_upd_i,
+      .in_v_i(xb_v && xb_dot), .in_first_i(xb_first), .in_last_i(xb_last), .in_k_i(xb_k),
+      .in_raw_i(xb_raw), .in_alt_i(xb_alt), .in_lm_i(xb_lm),
+      .in_vs2_i(xb_d[0]), .in_vs1_i(xb_d[1]), .in_vdo_i(xb_s[2]), .in_pd_i(xb_pd), .in_act_i(xb_act),
+      .in_bm_i(xb_bm), .in_tag_i({xb_pd, xb_rob, xb_raw}),
+      .a_rdy_o(d_rdy), .blk_o(d_blk), .rd_o(drd), .rd_d_i(drd_d),
+      .out_v_o(dv), .out_d_o(dd), .out_tag_o(dtag), .out_ff_o(dff)
+    );
+    // 影子级：有效 (误预测 / 冲刷作废) 与 br_mask (每拍清已解析的位)；s_rv 不管作废，只用来核对对齐
+    logic [XL-1:0] s_v, s_rv;
+    br_mask_t      s_bm [XL];
+    logic [31:0]   s_raw [XL];
+    always_ff @(posedge clk_i or negedge rst_ni)
+      if (!rst_ni) begin s_v <= '0; s_rv <= '0; end
+      else begin
+        s_rv <= {s_rv[XL-2:0], xb_vx};
+        s_v[0] <= xb_vx;
+        for (int s = 1; s < XL; s++) s_v[s] <= s_v[s-1] && !flush_i && !br_killed(s_bm[s-1], br_upd_i);
+      end
+    always_ff @(posedge clk_i) begin
+      s_bm[0] <= xb_bm; s_raw[0] <= xb_raw;
+      for (int s = 1; s < XL; s++) begin s_bm[s] <= br_mask_upd(s_bm[s-1], br_upd_i); s_raw[s] <= s_raw[s-1]; end
+    end
+    wire      vx_ok = s_v[XL-1] && !flush_i && !br_killed(s_bm[XL-1], br_upd_i);
+    preg_t    e_pd, d_pd;
+    rob_ptr_t e_rob, d_rob;
+    logic     e_first, e_last;
+    logic [31:0] d_raw;
+    assign {e_pd, e_rob, e_first, e_last} = o_tag;
+    assign {d_pd, d_rob, d_raw} = dtag;
+    // 写回口：o6_vex 与点积单元 (不同拍，见 d_blk)
+    assign xe_ok[x]  = vx_ok || dv;
+    assign xe_pd[x]  = dv ? d_pd : e_pd;
+    assign xe_od[x]  = dv ? dd : o_d;
+    assign xe_off[x] = dv ? dff : o_ff;
+    assign xe_raw[x] = dv ? d_raw : s_raw[XL-1];
+    logic [4:0] e_acc;                                    // 本条前几拍的 fflags
+    always_ff @(posedge clk_i)
+      if (vx_ok) e_acc <= e_first ? o_ff : (e_acc | o_ff);
+    assign vxw_v_o[x] = xe_ok[x];
+    assign vxw_p_o[x] = xe_pd[x];
+    always_comb begin
+      vx_cmpl_o[x] = '0;
+      if (dv) begin
+        vx_cmpl_o[x].valid   = 1'b1;
+        vx_cmpl_o[x].rob_idx = d_rob;
+        vx_cmpl_o[x].fflags  = dff;
+      end else begin
+        vx_cmpl_o[x].valid   = vx_ok && e_last;
+        vx_cmpl_o[x].rob_idx = e_rob;
+        vx_cmpl_o[x].fflags  = e_first ? o_ff : (e_acc | o_ff);
+      end
+    end
+`ifndef SYNTHESIS
+    always_ff @(posedge clk_i)
+      if (rst_ni) begin
+        assert (o_v == s_rv[XL-1]) else $error("vecu: 执行器 %0d o6_vex 输出 %b 与影子级 %b 不对齐 (XL = %0d)", x, o_v, s_rv[XL-1], XL);
+        assert (!(vx_v_i[x] && sq_v)) else $error("vecu: 执行器 %0d 序列器在送时 VIQ 又发了一条", x);
+        assert (!(dv && s_rv[XL-1])) else $error("vecu: 执行器 %0d 点积与 o6_vex 同拍写回", x);
+        if (x_new && vdot_op(vx_raw_i[x])) assert (d_rdy) else $error("vecu: 执行器 %0d 点积单元没有空缓冲却发来点积", x);
+        if (xe_ok[x]) begin
+          assert (xe_pd[x] < preg_t'(VCP)) else $error("vecu: VX%0d 目的 p%0d 不在核内池", x, xe_pd[x]);
+          for (int r = 0; r < 32; r++)
+            assert (crat[r] != xe_pd[x]) else $error("vecu: VX%0d 目的 p%0d 仍被 v%0d 映射", x, xe_pd[x], r);
+          for (int j = 0; j < RNQ; j++)
+            if (rq_v[j] && !rq_mk[j])
+              for (int k = 0; k < 8; k++)
+                if (k < int'(rq_nn[j])) assert (rq_p[j][k] != xe_pd[x]) else $error("vecu: VX%0d 目的 p%0d 是改名在途的寄存器", x, xe_pd[x]);
+        end
+        // (vtype 可能已被更老的 vsetvl 改掉：那时这条是要被冲刷的推测 uop，写的是没人读的新寄存器，不查 fast_ok)
+        if (x_new) assert (vooo_op(vx_raw_i[x])) else $error("vecu: VX%0d 收到 %h 不是乱序类", x, vx_raw_i[x]);
+      end
+`endif
+  end
+`ifndef SYNTHESIS
+  // 各执行器同拍写回的物理寄存器互不相同
+  always_ff @(posedge clk_i)
+    if (rst_ni)
+      for (int a = 0; a < NVX; a++)
+        for (int b = a + 1; b < NVX; b++)
+          if (xe_ok[a] && xe_ok[b]) assert (xe_pd[a] != xe_pd[b]) else $error("vecu: 执行器 %0d / %0d 同拍写 p%0d", a, b, xe_pd[a]);
+`endif
+
+  //--------------------------------------------------------------------------
+  // O1 在途写 vwpend_o：已提交 (在 VECU 里) 还没做完的写向量寄存器的指令写的寄存器 (保守)。
+  //   重命名用它与自己的未提交计数一起判乱序候选碰不碰在途写
+  //--------------------------------------------------------------------------
+  always_comb begin
+    logic [31:0] w;
+    w = p_wr | ff_wr;
+    for (int k = 0; k < QD; k++)
+      if (($clog2(QD)+1)'(k) < q_n) w = w | q_ws[$clog2(QD)'(q_h + $clog2(QD)'(k))];
+    if (x_busy || s2_v || s3_v || (s2p_v != '0)) w = w | x_wm;
+    if (s3_v) w = w | s3_wm;
+    for (int k = 0; k < LQD; k++)
+      if ((LQW+1)'(k) < lq_n && !lq_mk[LQW'(lq_h + LQW'(k))]) w = w | lq_ws[LQW'(lq_h + LQW'(k))];
+    if ((m_on || m_tail) && m_ld) w = w | me_rset;
+    for (int j = 0; j < RNQ; j++) if (rq_v[j] && !rq_mk[j]) w = w | rq_grp[j];
+    vwpend_o = w;
+  end
+
   always_ff @(posedge clk_i) begin
 `ifndef SYNTHESIS
-    if (!sim_zeroed) for (int r = 0; r < 32; r++) vrf[r] <= '0;
+    if (!sim_zeroed) for (int p = 0; p < N_VPREG; p++) vprf[p] <= '0;
 `endif
+    // O1 VX 写 (新分配的物理寄存器，与下面各口不会相同)
+    for (int x = 0; x < NVX; x++) if (xe_ok[x]) vprf[xe_pd[x]] <= xe_od[x];
+    // M3 LSU 向量 load 写口：本遍的字节写 load 数据；第一遍时其余字节写 vd 旧值 (尾部，及第二遍的位置先占着)
+    for (int k = 0; k < N_LDP; k++)
+      if (vlw_v_i[k]) begin
+        logic [VLEN-1:0] o;
+        logic [VLEN-1:0] m0;
+        logic [CL_B-1:0] em;
+        o  = vlw_old_i[k].cr ? vprf[crat[vlw_old_i[k].ar]] : vprf[vlw_old_i[k].p];
+        m0 = vlw_m0_i[k].cr ? vprf[crat[vlw_m0_i[k].ar]] : vprf[vlw_m0_i[k].p];
+        em = vlw_mk_i[k] ? vmbytes(m0, vlw_k_i[k], vlw_eb_i[k]) : '1;   // M4a
+        for (int b = 0; b < VLEN / 8; b++)
+          if (vlw_bm_i[k][b] && em[b])   vprf[vlw_pd_i[k]][8*b +: 8] <= vlw_d_i[k][8*b +: 8];
+          else if (vlw_ov_i[k]) vprf[vlw_pd_i[k]][8*b +: 8] <= o[8*b +: 8];
+      end
+    // 执行流水的 A / E 口按 crat；load 的 B / C / D 口按 wmap (I2b：改名在途时目的组是新的物理寄存器，
+    //   与同一架构寄存器上比 load 老的 A / E 写不是同一个物理寄存器，所以分两组各自写)
     for (int r = 0; r < 32; r++)
       for (int i = 0; i < VLEN; i++)
-        if (wa_hit[r] && wa_m[i]) vrf[r][i] <= wa_d[i];
-        else if (wb_hit[r] && wb_m[i]) vrf[r][i] <= wb_d[i];
+        if (wa_hit[r] && wa_m[i]) vprf[crat[r]][i] <= wa_d[i];
+        else if (we_hit[r] && we_m[i]) vprf[crat[r]][i] <= we_d[i];
+    for (int r = 0; r < 32; r++)
+      for (int i = 0; i < VLEN; i++)
+        if (wb_hit[r] && wb_m[i]) vprf[wmap[r]][i] <= wb_d[i];
+        else if (wc_hit[r] && wc_m[i]) vprf[wmap[r]][i] <= wc_d[i];
+        else if (wd_hit[r] && wd_m[i]) vprf[wmap[r]][i] <= wd_d[i];
+    // I2b 切换：没被 load 写到的字节从旧的物理寄存器补到新的 (这拍没有别的写落在这几个新的物理寄存器上)
+    if (rn_sw)
+      for (int k = 0; k < 8; k++)
+        if (k < int'(sh_nn))
+          for (int b = 0; b < VLB; b++)
+            if (!rq_wm[rq_h][k][b]) vprf[rq_p[rq_h][k]][8*b +: 8] <= vprf[crat[sh_vd + 5'(k)]][8*b +: 8];
   end
+`ifndef SYNTHESIS
+  // 浮点快车道 (E 口) 与其余各口同拍写的寄存器不相交 (计分板 ff_wr / p_wr / m_pw)
+  always_ff @(posedge clk_i)
+    if (rst_ni && we_v) assert (!wa_hit[we_r] && ((!wb_hit[we_r] && !wc_hit[we_r] && !wd_hit[we_r]) || wmap[we_r] != crat[we_r]))
+      else $error("vecu: 浮点快车道与其它写口同拍写同一寄存器 v%0d", we_r);   // load 写改了名的 (新物理寄存器) 不算
+  // 执行流水 (A 口) 与 load 写回 (B / C / D 口) 同拍时写的寄存器不相交 (计分板 m_pw)
+  always_ff @(posedge clk_i)
+    if (rst_ni && wa_v && m_wr) assert ((!wb_hit[wa_r] && !wc_hit[wa_r] && !wd_hit[wa_r]) || wmap[wa_r] != crat[wa_r])
+      else $error("vecu: 执行流水与 load 写回同拍写同一寄存器 v%0d", wa_r);   // load 写改了名的不算 (I2b)
+`endif
 
 `ifndef SYNTHESIS
   always_ff @(posedge clk_i)
-    if (rst_ni) assert (!(req_v_i && rs != R_IDLE)) else $error("vu: 上一条请求未完成又来新请求");
+    if (rst_ni) assert (!(req_v_i && rs != R_IDLE)) else $error("vecu: 上一条请求未完成又来新请求");
+  // (I1.3c 起访存期间运算流水 / 快车道在途的写可以与 load 写回同拍，只要求寄存器不相交，见上面的断言)
   always_ff @(posedge clk_i)
-    if (rst_ni) assert (!(m_wr && x_wr)) else $error("vu: 访存 load 写回与执行流水同拍写寄存器堆");
+    if (rst_ni) assert (!(p_out && s1_s3)) else $error("vecu: 运算流水出口与 S1 直通同拍进 S3");
+  // +wpreg=N：调试用，打印所有落到物理寄存器 N 的写 (各口) 及 crat 指向它的架构寄存器的变化
+  int wpreg;
+  logic [$bits(crat[0])-1:0] wp_crat [32];
+  initial if (!$value$plusargs("wpreg=%d", wpreg)) wpreg = -1;
   always_ff @(posedge clk_i)
-    if (rst_ni) assert (!(p_out && s1_s3)) else $error("vu: 运算流水出口与 S1 直通同拍进 S3");
+    if (wpreg >= 0 && rst_ni) begin
+      for (int x = 0; x < NVX; x++)
+        if (xe_ok[x] && int'(xe_pd[x]) == wpreg) $display("[wpreg %0t] VX%0d 写 p%0d d=%h", $time, x, wpreg, xe_od[x][63:0]);
+      for (int k = 0; k < N_LDP; k++)
+        if (vlw_v_i[k] && int'(vlw_pd_i[k]) == wpreg) $display("[wpreg %0t] LSU load 写 p%0d ov=%0d", $time, wpreg, vlw_ov_i[k]);
+      for (int r = 0; r < 32; r++) begin
+        if (wa_hit[r] && int'(crat[r]) == wpreg) $display("[wpreg %0t] A 口 v%0d -> p%0d m=%h d=%h", $time, r, wpreg, wa_m[63:0], wa_d[63:0]);
+        if (we_hit[r] && int'(crat[r]) == wpreg) $display("[wpreg %0t] E 口 v%0d -> p%0d m=%h d=%h", $time, r, wpreg, we_m[63:0], we_d[63:0]);
+        if ((wb_hit[r] || wc_hit[r] || wd_hit[r]) && int'(wmap[r]) == wpreg)
+          $display("[wpreg %0t] B/C/D 口 v%0d -> p%0d hit=%b%b%b mb=%h db=%h mc=%h dc=%h md=%h dd=%h", $time, r, wpreg, wb_hit[r], wc_hit[r], wd_hit[r],
+                   wb_m[63:0], wb_d[63:0], wc_m[63:0], wc_d[63:0], wd_m[63:0], wd_d[63:0]);
+        if (int'(crat[r]) == wpreg && int'(wp_crat[r]) != wpreg) $display("[wpreg %0t] crat v%0d -> p%0d", $time, r, wpreg);
+        if (int'(crat[r]) != wpreg && int'(wp_crat[r]) == wpreg) $display("[wpreg %0t] crat v%0d 离开 p%0d (现 p%0d)", $time, r, wpreg, crat[r]);
+        wp_crat[r] <= crat[r];
+      end
+      if (rn_sw)
+        for (int k = 0; k < 8; k++)
+          if (k < int'(sh_nn) && int'(rq_p[rq_h][k]) == wpreg)
+            $display("[wpreg %0t] 改名切换补字节 v%0d -> p%0d (旧 p%0d=%h) wm=%h mk=%0d", $time, sh_vd + 5'(k), wpreg,
+                     crat[sh_vd + 5'(k)], vprf[crat[sh_vd + 5'(k)]][63:0], rq_wm[rq_h][k][15:0], rq_mk[rq_h]);
+    end
   // +vutrace：每条异步指令开始执行 / 每条请求的响应
   bit vutrace;
   initial vutrace = $test$plusargs("vutrace");
   always_ff @(posedge clk_i)
     if (vutrace && rst_ni) begin
-      if (x_start) $display("[vu %0t] 执行 inst=%08h a=%016h vl=%0d sew=%0d", $time, qi, q_a[q_h], vl, sew);
-      if (do_rsp)  $display("[vu %0t] 响应 inst=%08h k=%0d excp=%0d data=%016h", $time, ri, rd_.k, rsp_excp_o, rsp_data_o);
+      if (x_start) $display("[vecu %0t] 执行 inst=%08h a=%016h vl=%0d sew=%0d", $time, qi, q_a[q_h], vl, sew);
+      if (do_rsp)  $display("[vecu %0t] 响应 inst=%08h k=%0d excp=%0d data=%016h", $time, ri, rd_.k, rsp_excp_o, rsp_data_o);
+      if (cv_go_i) $display("[vecu %0t] 提交 inst=%08h a=%016h", $time, cv_inst_i, cv_ax);
+      if (wa_v)    $display("[vecu %0t] A 口写 v%0d k=%0d m=%h d=%h", $time, wa_r, s3_k, wa_m[63:0], wa_d[63:0]);
+      if (s1_s2)   $display("[vecu %0t] S1 inst=%08h vs2[0]=%h vs1[0]=%h vrf=%h vprf=%h", $time, xi, s1_vs2[63:0], s1_vs1[63:0],
+                            vrf[xd.vs2][63:0], vprf[crat[xd.vs2]][63:0]);
+      if (we_v)    $display("[vecu %0t] E 口写 v%0d 块 %0d 槽 %0d m=%h d=%h", $time, we_r, sl[fr_s].blk, fr_s, fr_m[63:0], fr_d[63:0]);
+      if (ff_alloc) $display("[vecu %0t] 快车道发射 inst=%08h 槽 %0d xbi=%0d fk=%0d A=%b B=%b", $time, xi, sl_h, xbi, f_k[0], fl_fire, fl2_go);
+      if (cv_ill_o) $display("[vecu %0t] 提交口非法 inst=%08h", $time, cv_inst_i);
+      if (ma_go)    $display("[vecu %0t] 异步 load 开始 inst=%08h a=%016h 改名=%0d q 里更老 %0d", $time, lq_inst[lq_h], lq_a[lq_h], lq_rn, lq_qold[lq_h]);
+      if (m_go)     $display("[vecu %0t] 同步访存开始 inst=%08h", $time, ri_q);
+      if (rn_sw)    $display("[vecu %0t] 改名切换 v%0d..+%0d -> p%0d.. (项 %0d%s)", $time, sh_vd, sh_nn, rq_p[rq_h][0], rq_h,
+                             rq_mk[rq_h] ? " 乱序标记" : "");
+      for (int j = 0; j < NVC; j++)
+        if (3'(j) < mf_n)
+          $display("[vecu %0t] 快切换 #%0d v%0d..+%0d -> p%0d.. (旧 p%0d) cf_n=%0d rn_sw=%b crat0..3=%0d %0d %0d %0d", $time, j, lq_vd[LQW'(lq_h + LQW'(j))],
+                   lq_ng[LQW'(lq_h + LQW'(j))], lq_pg[LQW'(lq_h + LQW'(j))][0], crat[lq_vd[LQW'(lq_h + LQW'(j))]], cf_n, rn_sw,
+                   crat[0], crat[1], crat[2], crat[3]);
+      if (cv_gon_i > 3'd1) $display("[vecu %0t] 提交口同拍收 %0d 条 (lq_n=%0d)", $time, cv_gon_i, lq_n);
+      for (int k = 0; k < W; k++) if (vfr_v_o[k] && $isunknown(vfr_p_o[k])) $display("[vecu %0t] 回收口 %0d 是 X (cf_h=%0d cf_n=%0d)", $time, k, cf_h, cf_n);
+      for (int x = 0; x < NVX; x++)
+        if (xe_ok[x]) $display("[vecu %0t] VX%0d inst=%08h -> p%0d d=%h ff=%b", $time, x, xe_raw[x], xe_pd[x], xe_od[x][63:0], xe_off[x]);
     end
 `endif
 endmodule
 
 //------------------------------------------------------------------------------
-// o6_vu_alu：一个计算宽度为 W 的元素槽 (每拍 DLEN / W 个)，结果 r、掩码位 m、饱和 s
+// o6_vecu_alu：一个计算宽度为 W 的元素槽 (每拍 DLEN / W 个)，结果 r、掩码位 m、饱和 s
 //   a = vs2 元素，b = vs1 元素 / 标量 / 立即数，c = vd 旧值 (都已扩展到 W)；cin = v0 的位
 //   运算器各一个、按操作码复用 (原先每种操作各写一个，DC 展开成每槽十来个加法器 / 比较器 / 移位器与 9 个乘法器)：
 //   W+1 位加法器 t：按操作选零 / 符号扩展、加 / 减 / 反减、进位输入，t 是精确的和 / 差 ——
@@ -2945,8 +4387,8 @@ endmodule
 `elsif O6_DW_SIM
 `define O6_VALU_DW
 `endif
-module o6_vu_alu
-  import o6_vu_pkg::*;
+module o6_vecu_alu
+  import o6_vecu_pkg::*;
 #(
   parameter int W  = 8,
   parameter int NP = 0
@@ -3289,11 +4731,11 @@ endmodule
 `undef O6_VALU_DW
 
 //------------------------------------------------------------------------------
-// o6_vu_dvs：一个除法槽，恢复余数除法每拍 1 位商 (w = 8 << cw 拍)；W = 本槽最大元素宽度 (w <= W)
+// o6_vecu_dvs：一个除法槽，恢复余数除法每拍 1 位商 (w = 8 << cw 拍)；W = 本槽最大元素宽度 (w <= W)
 //   无符号做模，有符号先取绝对值、最后修正符号；除 0：商全 1、余数 = 被除数；
 //   有符号溢出 (最小值 / -1)：商 = 被除数、余数 = 0 (与 Spike 一致)
 //------------------------------------------------------------------------------
-module o6_vu_dvs #(
+module o6_vecu_dvs #(
   parameter int W = 64
 ) (
   input  wire          clk_i,
@@ -3345,11 +4787,11 @@ module o6_vu_dvs #(
   end
 endmodule
 
-`ifdef O6_VU_FPBB
+`ifdef O6_VECU_FPBB
 //------------------------------------------------------------------------------
-// o6_vu_fpbb：时序摸底用的 fpnew 桩 (输出寄存；不是功能模型，只在综合 VU_FPBB=1 时用)
+// o6_vecu_fpbb：时序摸底用的 fpnew 桩 (输出寄存；不是功能模型，只在综合 VECU_FPBB=1 时用)
 //------------------------------------------------------------------------------
-module o6_vu_fpbb #(
+module o6_vecu_fpbb #(
   parameter int TW = 1,
   parameter int CW = 16
 ) (

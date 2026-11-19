@@ -132,7 +132,7 @@ module tb_top;
     if (u_vif.seip_set) soc_eirq[1] <= 1'b1;
   end
 `endif
-  typedef struct { longint addr; logic [3:0] id; longint due; } ar_t;
+  typedef struct { longint addr; logic [3:0] id; longint due; logic [7:0] len; } ar_t;
   ar_t             arq [$];
   logic [PA_W-1:0] r_addr, w_addr;
   logic [3:0]      r_id;
@@ -168,13 +168,13 @@ module tb_top;
           if (axi_ooo == 0) break;
         end
         if (k >= 0) begin
-          r_busy <= 1'b1; r_addr <= arq[k].addr[PA_W-1:0]; r_id <= arq[k].id; r_left <= 8'd3;
+          r_busy <= 1'b1; r_addr <= arq[k].addr[PA_W-1:0]; r_id <= arq[k].id; r_left <= arq[k].len;
           arq.delete(k);
         end
       end
       if (arvalid && arready) begin
-        assert (arlen == 8'd3) else $error("tb AXI：只支持 4 拍读突发");
-        arq.push_back('{addr: {{(64-PA_W){1'b0}}, araddr}, id: arid, due: cyc + axi_lat});
+        assert (arlen == 8'(CL_B / 16 - 1)) else $error("tb AXI：只支持一行 (M1：128 B = 8 拍) 的读突发");
+        arq.push_back('{addr: {{(64-PA_W){1'b0}}, araddr}, id: arid, due: cyc + axi_lat, len: arlen});
       end
       if (awvalid && awready) begin w_busy <= 1'b1; w_addr <= awaddr; w_data_done <= 1'b0; end
       if (wvalid && wready) begin
@@ -204,8 +204,8 @@ module tb_top;
   // DUT
   //--------------------------------------------------------------------------
   logic         mem_req_valid, mem_req_ready, mem_req_we, mem_resp_valid, mem_resp_ready;
-  logic [PA_W-1:6] mem_req_addr;
-  logic [511:0] mem_req_data, mem_resp_data;
+  logic [PA_W-1:CL_O] mem_req_addr;
+  logic [CL_W-1:0] mem_req_data, mem_resp_data;
   logic [3:0]   mem_req_id, mem_resp_id;
   logic         mmio_req, mmio_we, mmio_ack;
   logic [PA_W-1:0] mmio_addr;
@@ -243,7 +243,7 @@ module tb_top;
     mem_resp_id = '0; mem_resp_data = '0;
     if (rdq.size() > 0) begin
       mem_resp_id = rdq[0].id[3:0];
-      for (int i = 0; i < 8; i++) mem_resp_data[64*i +: 64] = tb_mem_read64(rdq[0].addr + 8*i);
+      for (int i = 0; i < CL_ND; i++) mem_resp_data[64*i +: 64] = tb_mem_read64(rdq[0].addr + 8*i);
     end
   end
   always @(posedge clk) if (!rst_n) rdq.delete();     // 复位时丢掉在途读 (+midrst：同 SoC 的 AXI 模型，互连随核一起复位)
@@ -251,8 +251,8 @@ module tb_top;
     if (mem_resp_valid && mem_resp_ready) void'(rdq.pop_front());
     if (mem_req_valid && mem_req_ready) begin
       longint a;
-      a = {mem_req_addr, 6'b0};
-      if (mem_req_we) for (int i = 0; i < 8; i++) tb_mem_write64(a + 8*i, mem_req_data[64*i +: 64], 8'hFF);
+      a = {mem_req_addr, CL_O'(0)};
+      if (mem_req_we) for (int i = 0; i < CL_ND; i++) tb_mem_write64(a + 8*i, mem_req_data[64*i +: 64], 8'hFF);
       else rdq.push_back('{addr: a, id: mem_req_id, due: cyc + mem_lat});
     end
   end
@@ -343,6 +343,7 @@ module tb_top;
   bit     do_cosim;
   longint last_commit_cyc = 0;
   longint n_commit = 0;
+  longint n_icmt = 0;
   int     n_err = 0;
   // 结束：非 UVM 直接 $finish；UVM 下置 tb_done (非阻塞，同拍各块看到的一致)，由 UVM 测试收尾
   bit     tb_done = 0, tb_pass = 0, fin_called = 0;
@@ -355,7 +356,8 @@ module tb_top;
   longint pf_cmt_hist [7] = '{default: 0};
   longint pf_fl_replay = 0, pf_fl_trap = 0, pf_fl_after = 0, pf_viol = 0;
   longint pf_fe_ovr = 0, pf_fe_ovr_tk = 0, pf_fe_ovr_nt = 0, pf_fe_btb = 0;   // 前端 F3 覆盖 F0 的 uBTB 推测
-  longint n_vacc = 0, n_vcmt = 0, n_vchk = 0;    // 向量单元收下 / 提交的向量指令数、整体比对次数
+  longint n_vacc = 0, n_vcmt = 0, n_vchk = 0;
+  bit     v_gopen = 0;            // M3：展开的向量 load 提交到一半 (这期间不整体比对)    // 向量单元收下 / 提交的向量指令数、整体比对次数
   bit     v_dirty = 0, v_fpend = 0;
   logic [31:0] vh_inst [64];
   logic [63:0] vh_vt [64];
@@ -369,6 +371,35 @@ module tb_top;
   longint pf_mis_cond = 0, pf_mis_cond_tk = 0, pf_mis_ret = 0, pf_mis_ind = 0, pf_mis_jal = 0;
   // 分派停顿按原因 (同一拍可多项)：ROB 满、各发射队列空位不够、LQ / SQ 空位不够
   longint pf_ds_rob = 0, pf_ds_lq = 0, pf_ds_sq = 0;
+  // SQ 排出：出队数、占用、满 / 空、头部就绪待写 / 未提交；D$ store 状态机各状态拍数
+  longint pf_sq_pair = 0, pf_sq_pop = 0, pf_sq_occ = 0, pf_sq_full = 0, pf_sq_empty = 0, pf_sq_hrdy = 0, pf_sq_hncm = 0;
+  // 向量单元利用率 (P0 摸底)：请求等待、队列满、同步排空、访存、执行流水忙、访存口握手 / 背压 / 在途、完全空闲
+  longint pf_v_req = 0, pf_v_qfull = 0, pf_v_sync = 0, pf_v_mem = 0, pf_v_exe = 0, pf_v_qocc = 0;
+  longint pf_v_fast = 0;
+  longint pf_vml = 0, pf_vmlp = 0, pf_vslow = 0;   // M3：向量 load 数据 uop 写完 / 写的遍数 / 要求走原路径
+  longint pf_vms = 0, pf_vmsw = 0, pf_vms2 = 0;   // M3b：向量 store 数据 uop 收到数据 / 按行排空的次数 / 其中跨行的第一次
+  longint pf_dr_rdy = 0, pf_dr_go = 0, pf_dr_cmt = 0, pf_dr_nc = 0, pf_dr_ss [8];   // M3b 调试：SQ 头 (向量 store) 可排空 / 正在排 / 已提交但数据或地址没好 / 没提交；可排空时 D$ store 状态
+  initial foreach (pf_dr_ss[i]) pf_dr_ss[i] = 0;
+  // M3b 调试：D$ store 进 S_MISS 时打印 (+smiss)
+  bit smiss_on; logic [2:0] smiss_prev;
+  initial smiss_on = $test$plusargs("smiss");
+  always @(posedge clk) if (smiss_on) begin
+    if (`CORE.u_dc.s_st == 3'd6 && smiss_prev != 3'd6)
+      $display("[smiss %0d] spa=%h hitq=%h match=%b alloc=%b lkf=%b vms=%b vpass=%b", cyc, `CORE.u_dc.spa_q, `CORE.u_dc.s_hit_q,
+               `CORE.u_dc.s_match, `CORE.u_dc.st_miss_alloc, `CORE.u_dc.s_lkf_q, `CORE.u_lsu.sqh.vms, `CORE.u_lsu.sqh.vpass);
+    smiss_prev <= `CORE.u_dc.s_st;
+    if (`CORE.u_lsu.drain_done && `CORE.u_lsu.sqh.vms)
+      $display("[vdrain %0d] sq=%0d pa=%h vpa0=%h vnb=%0d vpass=%b nm=%0d line=%b", cyc, `CORE.u_lsu.sq_head.idx, `CORE.u_lsu.dc_st_paddr_o,
+               `CORE.u_lsu.sqh.vpa0, `CORE.u_lsu.sqh.vnb, `CORE.u_lsu.sqh.vpass, $countones(`CORE.u_lsu.dc_st_lmask_o), `CORE.u_lsu.dc_st_line_o);
+    if (`CORE.vsd_v)
+      $display("[vsd %0d] sq=%0d rob=%0d/%0d", cyc, `CORE.vsd_sq.idx, `CORE.vsd_rob.row, `CORE.vsd_rob.col);
+    if (`CORE.u_dc.f_st == 2'd1)
+      $display("[evict %0d] set=%0d way=%0d old=%h v=%b new=%h", cyc, `CORE.u_dc.f_set, `CORE.u_dc.f_way,
+               {`CORE.u_dc.tag[`CORE.u_dc.f_set][`CORE.u_dc.f_way], 5'(`CORE.u_dc.f_set), 7'd0},
+               `CORE.u_dc.valid[`CORE.u_dc.f_set][`CORE.u_dc.f_way], {`CORE.u_dc.m_line[`CORE.u_dc.f_m], 7'd0});
+  end
+  longint pf_v_mreq = 0, pf_v_mpush = 0, pf_v_mbp = 0, pf_v_minfl = 0, pf_v_idle = 0, pf_v_cyc = 0;
+  longint pf_dst [8] = '{default: 0};
   // 重命名停顿按原因：输出队列满 (被分派堵住)、分支标签不够、整数 / 浮点空闲寄存器不够
   longint pf_rn_q = 0, pf_rn_tag = 0, pf_rn_ifl = 0, pf_rn_ffl = 0;
   longint pf_ds_iq [N_IQ] = '{default: 0};
@@ -472,6 +503,45 @@ module tb_top;
     end
     k = $countones(`CORE.cm_valid);
     pf_cmt_hist[k]++;
+    pf_sq_pop += `CORE.u_lsu.sq_pop;   // r11 每拍至多出队 1 项 (成对合并版本见 *.sqpair)
+`ifndef O6_NO_VEC
+    if (n_vacc != 0) begin
+      pf_v_cyc++;
+      if (`CORE.u_vecu.req_v_i) pf_v_req++;
+      pf_v_fast += $countones(`CORE.u_vecu.vxw_v_o);
+      for (int k = 0; k < N_LDP; k++) begin
+        if (`CORE.vlw_v[k]) pf_vmlp++;
+        if (`CORE.vlw_v[k] && `CORE.vlw_last[k]) pf_vml++;
+      end
+      if (`CORE.vml_slow) pf_vslow++;
+      if (`CORE.vsd_v) pf_vms++;
+      if (`CORE.u_lsu.drain_done && `CORE.u_lsu.sqh.vms) pf_vmsw++;
+      if (`CORE.u_lsu.vms_p0_done) pf_vms2++;
+      if (`CORE.u_lsu.sqv[`CORE.u_lsu.sq_head.idx] && `CORE.u_lsu.sqh.vms) begin
+        if (`CORE.u_lsu.sqh.committed && `CORE.u_lsu.sqh.addr_ok && `CORE.u_lsu.sqh.data_ok) begin
+          pf_dr_rdy++; pf_dr_ss[`CORE.u_dc.s_st]++;
+          if (`CORE.u_lsu.drain_go) pf_dr_go++;
+        end else if (`CORE.u_lsu.sqh.committed) pf_dr_cmt++;
+        else pf_dr_nc++;
+      end
+      if (`CORE.u_vecu.req_v_i && `CORE.u_vecu.rs == 2'd0 && `CORE.u_vecu.q_full) pf_v_qfull++;
+      if (`CORE.u_vecu.rs == 2'd2) pf_v_sync++;
+      if (`CORE.u_vecu.rs == 2'd3) pf_v_mem++;
+      if (`CORE.u_vecu.x_busy || `CORE.u_vecu.s2_v || `CORE.u_vecu.s3_v) pf_v_exe++;
+      pf_v_qocc += `CORE.u_vecu.q_n;
+      if (`CORE.u_vecu.vm_req_o) pf_v_mreq++;
+      if (`CORE.u_vecu.vm_req_o && `CORE.u_vecu.vm_ack_i) pf_v_mpush++;
+      if (`CORE.u_vecu.vm_req_o && !`CORE.u_vecu.vm_ack_i) pf_v_mbp++;
+      pf_v_minfl += `CORE.u_vecu.mq_n;
+      if (`CORE.u_vecu.idle_o && !`CORE.u_vecu.req_v_i) pf_v_idle++;
+    end
+`endif
+    pf_sq_occ += (1 << SQ_W) - `CORE.u_lsu.sq_free_o;
+    if (`CORE.u_lsu.sq_free_o == 0) pf_sq_full++;
+    if (`CORE.u_lsu.sq_free_o == (1 << SQ_W)) pf_sq_empty++;
+    if (`CORE.u_lsu.hs.ok && !`CORE.u_lsu.hs.is_amo) pf_sq_hrdy++;
+    if (`CORE.u_lsu.sqv[`CORE.u_lsu.sq_head.idx] && !`CORE.u_lsu.sqh.committed) pf_sq_hncm++;
+    pf_dst[`CORE.u_dc.s_st]++;
 `ifdef FE_M2
     // +headprof：零提交拍按 ROB 头指令的 PC 计数 (ROB 空的拍记 PC 0)，结束时写 headprof.txt
     if (hp_on && k == 0) begin
@@ -484,6 +554,104 @@ module tb_top;
     end
 `endif
   end
+`ifdef FE_M2
+`ifndef O6_NO_VEC
+  // +hot：两次提交 rdcycle 之间 (vbench 的热测区) 的统计，第二次时打印 [hot] 各行
+  bit hw_on, hw_in;
+  longint hw_c, hw_cm, hw_z, hw_vcm, hw_vblk, hw_rn, hw_rnq, hw_rnv, hw_ds, hw_ds_rob, hw_ds_sq, hw_ds_lq, hw_ds_iq, hw_ds_oth;
+  longint hw_ds_vdq, hw_ds_viq, hw_vdqn, hw_sqfull, hw_sqpop, hw_vlw, hw_vsd, hw_vold, hw_vmem, hw_viqv, hw_viqi, hw_vsi, hw_ldiss;
+  longint hw_xw [NVX];
+  longint hw_xbusy [NVX];
+  longint hw_dst [8];
+  longint hw_hp [longint];
+  int     hw_hf [longint];
+  initial hw_on = $test$plusargs("hot");
+  always @(posedge clk) if (hw_on && rst_n) begin
+    int nrc, k;
+    nrc = 0;
+    for (int c = 0; c < W; c++)
+      if (`CORE.cm_valid[c] && ((`CORE.u_rob.dbg_raw[`CORE.u_rob.head_row][c] & 32'hfff0707f) == 32'hc0002073)) nrc++;
+    if (hw_in) begin
+      k = $countones(`CORE.cm_valid);
+      hw_c++; hw_cm += k;
+      if (k == 0) begin
+        int hr, hc;
+        longint hp;
+        hr = `CORE.u_rob.head_row; hc = `CORE.u_rob.head_col;
+        hp = `CORE.u_rob.vld[hr][hc] ? `CORE.`FE.ftq_pc[`CORE.u_rob.ent[hr][hc].ftq_idx] + 64'(2 * `CORE.u_rob.ent[hr][hc].ftq_off) : 0;
+        hw_z++; hw_hp[hp]++;
+        if (`CORE.u_rob.vld[hr][hc]) hw_hf[hp] = `CORE.u_rob.ent[hr][hc].fu;
+      end
+      hw_vcm += `CORE.u_rob.vcm_o;
+      if (`CORE.u_rob.vreach_o && !`CORE.u_rob.vcm_o) hw_vblk++;
+      if (`CORE.de_valid != '0 && !`CORE.rn_ready) begin
+        hw_rn++;
+        if (|`CORE.u_rn.q1_v) hw_rnq++;
+        if (!`CORE.u_rn.vfl_ge[`CORE.u_rn.n_v] || `CORE.u_rn.v_stall) hw_rnv++;
+      end
+      if (`CORE.rn_valid != '0 && !`CORE.ds_ready) begin
+        logic any;
+        any = 1'b0;
+        hw_ds++;
+        if (!`CORE.u_ds.rob_ready_i) begin hw_ds_rob++; any = 1'b1; end
+        for (int q = 0; q < N_IQ; q++) if (7'(`CORE.u_ds.in_need_i.iqn[q]) > `CORE.u_ds.iq_free_i[q]) any = 1'b1;
+        if (any && `CORE.u_ds.rob_ready_i) hw_ds_iq++;
+        if ((LQ_W+1)'(`CORE.u_ds.in_need_i.nld) > `CORE.u_ds.lq_free_i) begin hw_ds_lq++; any = 1'b1; end
+        if ((SQ_W+1)'(`CORE.u_ds.in_need_i.nst) > `CORE.u_ds.sq_free_i) begin hw_ds_sq++; any = 1'b1; end
+        if (!any) hw_ds_oth++;
+        if (!`CORE.vdq_ok) hw_ds_vdq++;
+        if (!`CORE.viq_ok) hw_ds_viq++;
+      end
+      if (`CORE.u_lsu.sq_free_o == 0) hw_sqfull++;
+      hw_vdqn += `CORE.vdq_n;
+      hw_sqpop += `CORE.u_lsu.sq_pop;
+      hw_dst[`CORE.u_dc.s_st]++;
+      for (int p = 0; p < N_LDP; p++) if (`CORE.vlw_v[p]) hw_vlw++;
+      if (`CORE.vsd_v) hw_vsd++;
+      if (`CORE.u_vecu.x_busy || `CORE.u_vecu.s2_v || `CORE.u_vecu.s3_v) hw_vold++;
+      if (`CORE.u_vecu.rs == 2'd3) hw_vmem++;
+      hw_viqv += $countones(`CORE.u_viq.val);
+      hw_viqi += $countones(`CORE.u_viq.xv);
+      if (`CORE.u_viq.vs_v_o) hw_vsi++;
+      for (int x = 0; x < NVX; x++) begin
+        if (`CORE.u_vecu.xe_ok[x]) hw_xw[x]++;
+        if (!`CORE.u_vecu.vx_rdy_o[x] || `CORE.u_viq.xv[x]) hw_xbusy[x]++;
+      end
+    end
+    if (nrc != 0) begin
+      if (!hw_in) begin
+        hw_in = 1'b1;
+        hw_c = 0; hw_cm = 0; hw_z = 0; hw_vcm = 0; hw_vblk = 0; hw_rn = 0; hw_rnq = 0; hw_rnv = 0; hw_ds = 0; hw_ds_rob = 0;
+        hw_ds_sq = 0; hw_ds_lq = 0; hw_ds_vdq = 0; hw_ds_viq = 0; hw_vdqn = 0; hw_ds_iq = 0; hw_ds_oth = 0; hw_sqfull = 0; hw_sqpop = 0; hw_vlw = 0; hw_vsd = 0;
+        hw_vold = 0; hw_vmem = 0; hw_viqv = 0; hw_viqi = 0; hw_vsi = 0;
+        for (int x = 0; x < NVX; x++) begin hw_xw[x] = 0; hw_xbusy[x] = 0; end
+        for (int s = 0; s < 8; s++) hw_dst[s] = 0;
+        hw_hp.delete();
+      end else begin
+        hw_in = 1'b0;
+        $display("[hot] 拍 %0d  提交 %0d (IPC %0.2f)  零提交 %0d 拍  向量提交 %0d (VEA 口被占 / 不收 %0d 拍)",
+                 hw_c, hw_cm, 1.0 * hw_cm / hw_c, hw_z, hw_vcm, hw_vblk);
+        $display("[hot] 重命名停 %0d (输出队列满 %0d、向量空闲表 / 在途写 %0d)  分派停 %0d (ROB %0d  IQ %0d  LQ %0d  SQ %0d  其它 (VIQ / VDQ 等) %0d)",
+                 hw_rn, hw_rnq, hw_rnv, hw_ds, hw_ds_rob, hw_ds_iq, hw_ds_lq, hw_ds_sq, hw_ds_oth);
+        $display("[hot] 分派停里：VDQ 满 %0d  VIQ 满 %0d  VDQ 平均占用 %0.2f / %0d", hw_ds_vdq, hw_ds_viq, 1.0 * hw_vdqn / hw_c, VDQ_N);
+        $display("[hot] VIQ 平均占用 %0.2f  运算发射 %0d  store 数据 %0d  各执行器写回 %0d %0d %0d %0d  忙 %0d %0d %0d %0d",
+                 1.0 * hw_viqv / hw_c, hw_viqi, hw_vsi, hw_xw[0], hw_xw[1], hw_xw[2], hw_xw[3], hw_xbusy[0], hw_xbusy[1], hw_xbusy[2], hw_xbusy[3]);
+        $display("[hot] 向量 load 写回 %0d 行  SQ 出队 %0d  SQ 满 %0d 拍  D$ store 状态 %0d %0d %0d %0d %0d %0d %0d %0d  原路径执行忙 %0d  R_MEM %0d",
+                 hw_vlw, hw_sqpop, hw_sqfull, hw_dst[0], hw_dst[1], hw_dst[2], hw_dst[3], hw_dst[4], hw_dst[5], hw_dst[6], hw_dst[7], hw_vold, hw_vmem);
+        foreach (hw_hp[pc])
+          if (hw_hp[pc] * 50 >= hw_z) $display("[hot] 零提交时 ROB 头 pc=%h fu=%0d：%0d 拍", pc, hw_hf.exists(pc) ? hw_hf[pc] : -1, hw_hp[pc]);
+      end
+    end
+  end
+`endif
+`endif
+  // +vlwlog：各 load 流水的向量 load 写回 / 向量 load uop 发射 (调试 load 吞吐)
+  bit vlw_on;
+  initial vlw_on = $test$plusargs("vlwlog");
+  always @(posedge clk) if (vlw_on && rst_n) begin
+    for (int p = 0; p < N_LDP; p++)
+      if (`CORE.vlw_v[p]) $display("[vlw %0d] 流水 %0d -> p%0d last=%b", cyc, p, `CORE.vlw_pd[p], `CORE.vlw_last[p]);
+  end
   initial hp_on = $test$plusargs("headprof");
   final if (hp_on) begin
     int fd;
@@ -494,6 +662,18 @@ module tb_top;
   task automatic perf_report();
     if (n_vacc != 0)
       $display("[perf] 向量：收下 %0d 条、提交 %0d 条，整体比对 %0d 次", n_vacc, n_vcmt, n_vchk);
+    if (pf_v_cyc != 0) begin
+      $display("[vperf] 乱序 VX 执行 %0d 个 uop (O1)", pf_v_fast);
+      $display("[vperf] 共用 LSU 的向量 load uop %0d 个 (写 %0d 遍)，转原路径 %0d 次 (M3)", pf_vml, pf_vmlp, pf_vslow);
+      $display("[vperf] 共用 LSU 的向量 store uop %0d 个，按行排空 %0d 次 (其中跨行第一次 %0d) (M3b)", pf_vms, pf_vmsw, pf_vms2);
+      $display("[vperf] SQ 头向量 store：可排空 %0d 拍 (其中在排 %0d)，已提交未就绪 %0d，未提交 %0d；可排空时 D$ store 状态 %0d %0d %0d %0d %0d %0d %0d %0d", pf_dr_rdy, pf_dr_go, pf_dr_cmt, pf_dr_nc, pf_dr_ss[0], pf_dr_ss[1], pf_dr_ss[2], pf_dr_ss[3], pf_dr_ss[4], pf_dr_ss[5], pf_dr_ss[6], pf_dr_ss[7]);
+      $display("[vperf] 拍=%0d  执行流水忙 %0.1f%%  访存(R_MEM) %0.1f%%  同步排空 %0.1f%%  VECU 全空且无请求 %0.1f%%",
+               pf_v_cyc, 100.0 * pf_v_exe / pf_v_cyc, 100.0 * pf_v_mem / pf_v_cyc, 100.0 * pf_v_sync / pf_v_cyc, 100.0 * pf_v_idle / pf_v_cyc);
+      $display("[vperf] 请求在等 %0.1f%%  其中队列满 %0.1f%%  平均队列占用 %0.2f / 8",
+               100.0 * pf_v_req / pf_v_cyc, 100.0 * pf_v_qfull / pf_v_cyc, 1.0 * pf_v_qocc / pf_v_cyc);
+      $display("[vperf] 访存口：请求 %0d 拍  收下 %0d 行 (%0.3f 行/拍，R_MEM 内 %0.3f)  背压 %0d 拍  平均在途 %0.2f",
+               pf_v_mreq, pf_v_mpush, 1.0 * pf_v_mpush / pf_v_cyc, 1.0 * pf_v_mpush / (pf_v_mem + 1), pf_v_mbp, 1.0 * pf_v_minfl / pf_v_cyc);
+    end
     $display("[perf] 提交分支=%0d  误预测率=%0.2f%%  (每千条指令 %0.1f 次)", pf_br_commit,
              100.0 * pf_br_redirect / (pf_br_commit + 1), 1000.0 * pf_br_redirect / (n_commit + 1));
     $display("[perf] 误预测分类：条件 %0d (实际跳 %0d)  返回 %0d  间接 %0d  JAL %0d",
@@ -518,6 +698,10 @@ module tb_top;
              pf_rn_q, pf_rn_tag, pf_rn_ifl, pf_rn_ffl);
     $display("[perf] 分派停顿原因 (拍)：ROB 满 %0d  IQ_A %0d  IQ_B %0d  IQ_C %0d  IQ_M %0d  IQ_N %0d  IQ_F %0d  IQ_S %0d  IQ_D %0d  LQ %0d  SQ %0d",
              pf_ds_rob, pf_ds_iq[0], pf_ds_iq[1], pf_ds_iq[6], pf_ds_iq[2], pf_ds_iq[7], pf_ds_iq[3], pf_ds_iq[4], pf_ds_iq[5], pf_ds_lq, pf_ds_sq);
+    $display("[perf] SQ 排出：出队 %0d 个 (%0.3f /拍，成对 %0d 次)  平均占用 %0.1f  满 %0d 拍  空 %0d 拍  头部就绪 (可写 D$) %0d 拍  头部未提交 %0d 拍",
+             pf_sq_pop, 1.0 * pf_sq_pop / cyc, pf_sq_pair, 1.0 * pf_sq_occ / cyc, pf_sq_full, pf_sq_empty, pf_sq_hrdy, pf_sq_hncm);
+    $display("[perf] D$ store 状态机 (拍)：IDLE %0d  LOOK %0d  DONE %0d  MISS %0d  AMO/CBO %0d",
+             pf_dst[0], pf_dst[1], pf_dst[5], pf_dst[6], pf_dst[2] + pf_dst[3] + pf_dst[4] + pf_dst[7]);
     $display("[perf] 每拍提交数分布 0..6: %0d %0d %0d %0d %0d %0d %0d", pf_cmt_hist[0], pf_cmt_hist[1],
              pf_cmt_hist[2], pf_cmt_hist[3], pf_cmt_hist[4], pf_cmt_hist[5], pf_cmt_hist[6]);
   endtask
@@ -526,31 +710,31 @@ module tb_top;
   longint watch_a = -1;
   initial void'($value$plusargs("watch=%h", watch_a));
   always @(posedge clk) if (rst_n && watch_a >= 0) begin
-    logic [PA_W-1:6] wl;
-    wl = watch_a[PA_W-1:6];
+    logic [PA_W-1:CL_O] wl;
+    wl = watch_a[PA_W-1:CL_O];
     if (`CORE.mem_req_valid_o && `CORE.mem_req_ready_i && `CORE.mem_req_addr_o == wl)
       $display("[watch %0d] 核->下游 %s id=%h d[63:0]=%h", cyc, `CORE.mem_req_we_o ? "写回" : "读", `CORE.mem_req_id_o,
-               `CORE.mem_req_data_o[64*watch_a[5:3] +: 64]);
+               `CORE.mem_req_data_o[64*watch_a[CL_O-1:3] +: 64]);
     if (`CORE.u_dc.f_st == 2 && {`CORE.u_dc.tag[`CORE.u_dc.f_set][`CORE.u_dc.f_way], `CORE.u_dc.f_set} == wl &&
         `CORE.u_dc.valid[`CORE.u_dc.f_set][`CORE.u_dc.f_way])
       $display("[watch %0d] D$ 替换出该行 (dirty=%0d)", cyc, `CORE.u_dc.dirty[`CORE.u_dc.f_set][`CORE.u_dc.f_way]);
     if (`CORE.u_dc.f_st == 2 && `CORE.u_dc.m_line[`CORE.u_dc.f_m] == wl)
       $display("[watch %0d] D$ 回填该行", cyc);
-    if (`CORE.u_dc.st_miss_alloc && `CORE.u_dc.spa[PA_W-1:6] == wl)
+    if (`CORE.u_dc.st_miss_alloc && `CORE.u_dc.spa[PA_W-1:CL_O] == wl)
       $display("[watch %0d] D$ store 缺失分配 MSHR%0d (f_st=%0d)", cyc, `CORE.u_dc.st_alloc_idx, `CORE.u_dc.f_st);
     for (int k = 0; k < N_LDP; k++)
-      if (`CORE.u_dc.l1_alloc[k] && `CORE.u_dc.l1_alloc_ok[k] && `CORE.u_dc.ld_paddr_i[k][PA_W-1:6] == wl)
+      if (`CORE.u_dc.l1_alloc[k] && `CORE.u_dc.l1_alloc_ok[k] && `CORE.u_dc.ld_paddr_i[k][PA_W-1:CL_O] == wl)
         $display("[watch %0d] D$ load%0d 缺失分配 MSHR%0d (f_st=%0d hit=%b match=%b go=%b)", cyc, k,
                  `CORE.u_dc.l1_alloc_idx[k], `CORE.u_dc.f_st, `CORE.u_dc.l1_hit_oh[k], `CORE.u_dc.l1_match[k],
                  `CORE.u_dc.l1_go[k]);
-    if (`CORE.dc_st_req && `CORE.dc_st_done && `CORE.dc_st_paddr[PA_W-1:6] == wl)
+    if (`CORE.dc_st_req && `CORE.dc_st_done && `CORE.dc_st_paddr[PA_W-1:CL_O] == wl)
       $display("[watch %0d] D$ store/AMO paddr=%h data=%h mask=%h amo=%0d", cyc, `CORE.dc_st_paddr, `CORE.dc_st_data,
                `CORE.dc_st_mask, `CORE.dc_st_amo);
 `ifdef TB_SOC
     if (u_soc.mem_resp_valid && u_soc.mem_resp_ready && watch_a >= 0)
       ; // 响应不带地址，靠 id 对应
     if (u_soc.b_req_valid && u_soc.b_req_ready && u_soc.b_req_addr == wl)
-      $display("[watch %0d] L2->桥 %s d[63:0]=%h", cyc, u_soc.b_req_we ? "写" : "读", u_soc.b_req_data[64*watch_a[5:3] +: 64]);
+      $display("[watch %0d] L2->桥 %s d[63:0]=%h", cyc, u_soc.b_req_we ? "写" : "读", u_soc.b_req_data[64*watch_a[CL_O-1:3] +: 64]);
 `endif
   end
 
@@ -603,9 +787,9 @@ module tb_top;
                `CORE.u_iqa.ent[i].rob_idx, `CORE.u_iqa.ent[i].fu, `CORE.u_iqa.ent[i].src1_busy, `CORE.u_iqa.ent[i].src2_busy,
                `CORE.u_iqa.ent[i].psrc1, `CORE.u_iqa.ent[i].psrc2, `CORE.u_iqa.spo[i], `CORE.u_iqa.spa[i]);
 `ifndef O6_NO_VEC
-    $display("[dump] VU: rs=%0d ri=%h q_n=%0d x_busy=%0d m_fin=%0d m_i=%0d m_a=%h vm_req=%0d vl=%0d vill=%0d mq_n=%0d  LSU vt_v=%0d vt_pw=%0d va_v=%0d dc s_st=%0d",
-             `CORE.u_vu.rs, `CORE.u_vu.ri, `CORE.u_vu.q_n, `CORE.u_vu.x_busy, `CORE.u_vu.m_fin, `CORE.u_vu.m_i,
-             `CORE.u_vu.m_a, `CORE.u_vu.vm_req_o, `CORE.u_vu.vl, `CORE.u_vu.vill, `CORE.u_vu.mq_n,
+    $display("[dump] VECU: rs=%0d ri=%h q_n=%0d x_busy=%0d m_fin=%0d m_i=%0d m_a=%h vm_req=%0d vl=%0d vill=%0d mq_n=%0d  LSU vt_v=%0d vt_pw=%0d va_v=%0d dc s_st=%0d",
+             `CORE.u_vecu.rs, `CORE.u_vecu.ri, `CORE.u_vecu.q_n, `CORE.u_vecu.x_busy, `CORE.u_vecu.m_fin, `CORE.u_vecu.m_i,
+             `CORE.u_vecu.m_a, `CORE.u_vecu.vm_req_o, `CORE.u_vecu.vl, `CORE.u_vecu.vill, `CORE.u_vecu.mq_n,
              `CORE.u_lsu.vt_v, `CORE.u_lsu.vt_pw, `CORE.u_lsu.va_v, `CORE.u_dc.s_st);
 `endif
     for (int k = 0; k < 3; k++)
@@ -657,6 +841,8 @@ module tb_top;
 `endif
   endtask
 
+  bit cmtlog_on;   // 调试：每个提交打印一行 (+cmtlog)
+  initial cmtlog_on = $test$plusargs("cmtlog");
   // 提交监视 (拍沿前的组合值)
   always @(posedge clk) if (rst_n && !tb_done) begin
     for (int c = 0; c < W; c++) begin
@@ -673,11 +859,16 @@ module tb_top;
 `ifndef NO_FPU
         if (rdt == 2) wd = `CORE.g_fpu.u_fpu.u_fprf.mem[`CORE.u_rob.cm_pdst_o[c]];
 `endif
+        if (cmtlog_on) $display("[cmt %0d] #%0d pc=%h insn=%h fu=%0d vgrp=%b vmid=%b vlast=%b vea=%b vml=%b", cyc, n_commit, pc, insn,
+                                `CORE.u_rob.hent[c].fu, `CORE.u_rob.hent[c].vgrp, `CORE.u_rob.hent[c].vmid, `CORE.u_rob.hent[c].vlast,
+                                `CORE.u_rob.hent[c].vea, `CORE.u_rob.hent[c].fu == FU_LD);
         n_commit++;
-        if (`CORE.u_rob.hent[c].fu == FU_VEC) n_vcmt++;
+        if (!(`CORE.u_rob.hent[c].vgrp && !`CORE.u_rob.hent[c].vlast)) n_icmt++;   // 按指令计 (展开的指令算一条，给 UVM 核对)
+        if ((`CORE.u_rob.hent[c].fu == FU_VEC && !`CORE.u_rob.hent[c].vgrp) || `CORE.u_rob.hent[c].vea) n_vcmt++;   // vea：提交送 VECU (I1.3b)；M3 的检查 uop 不送 VECU
+        if (`CORE.u_rob.hent[c].vgrp) v_gopen = !`CORE.u_rob.hent[c].vlast;   // M3：展开的指令提交到一半
         last_commit_cyc = cyc;
         hb_pc = pc;
-        if (do_cosim && cosim_commit(pc, insn, rdt, rd, wd) != 0) begin
+        if (do_cosim && !(`CORE.u_rob.hent[c].vgrp && !`CORE.u_rob.hent[c].vlast) && cosim_commit(pc, insn, rdt, rd, wd) != 0) begin   // M3：展开的指令按一条对拍 (最后一个 uop)
           n_err++;
           finish(1'b0, "对拍不一致");
         end
@@ -685,15 +876,26 @@ module tb_top;
     end
 `ifndef O6_NO_VEC
     // 向量单元：收下的向量指令都已提交 (Spike 也执行过) 且单元跑空时，整体比对向量寄存器与向量 CSR
-    if (`CORE.u_vu.rsp_v_o && !`CORE.u_vu.rsp_excp_o) begin
+    // I1.3b：提交口入队的也算收下 (与提交同拍)
+    if (`CORE.u_vecu.cv_go_i) begin
+      // V5：一拍至多 NVC 条 (头 + 跟着的切换标记)
+      for (int k = 0; k < NVC; k++)
+        if (3'(k) < `CORE.u_vecu.cv_gon_i) begin
+          n_vacc++; v_dirty = 1;
+          vh_inst[vh_p % 64] = (k == 0) ? `CORE.u_vecu.cv_inst_i : `CORE.u_vecu.cvx_inst_i[k];
+          vh_vt[vh_p % 64] = `CORE.u_vecu.vtype_rd; vh_vl[vh_p % 64] = `CORE.u_vecu.vl;
+          vh_p++;
+        end
+    end
+    if (`CORE.u_vecu.rsp_v_o && !`CORE.u_vecu.rsp_excp_o) begin
       n_vacc++; v_dirty = 1;
-      vh_inst[vh_p % 64] = `CORE.u_vu.ri; vh_vt[vh_p % 64] = `CORE.u_vu.vtype_rd; vh_vl[vh_p % 64] = `CORE.u_vu.vl;
+      vh_inst[vh_p % 64] = `CORE.u_vecu.ri; vh_vt[vh_p % 64] = `CORE.u_vecu.vtype_rd; vh_vl[vh_p % 64] = `CORE.u_vecu.vl;
       vh_p++;
     end
     // 回了异常的向量指令 (访存出错会改 vstart / 已完成的元素)：Spike 在陷入提交时才执行它，等陷入发生再比
-    if (`CORE.u_vu.rsp_v_o && `CORE.u_vu.rsp_excp_o) begin v_fpend = 1; v_dirty = 1; end
+    if (`CORE.u_vecu.rsp_v_o && `CORE.u_vecu.rsp_excp_o) begin v_fpend = 1; v_dirty = 1; end
     if (`CORE.u_cc.trap_o || `CORE.flush) v_fpend = 0;
-    if (do_cosim && v_dirty && !v_fpend && !`CORE.u_cc.trap_o && `CORE.u_vu.idle_o && n_vacc == n_vcmt) begin
+    if (do_cosim && v_dirty && !v_fpend && !v_gopen && !`CORE.u_cc.trap_o && `CORE.u_vecu.idle_o && n_vacc == n_vcmt) begin
       v_dirty = 0;
       n_vchk++;
       vh_p0_n = vh_p;
@@ -701,25 +903,25 @@ module tb_top;
         for (int w = 0; w < VLEN / 64; w++) begin
           longint sv;
           sv = cosim_vreg(r, w);
-          if (`CORE.u_vu.vrf[r][64*w +: 64] !== sv) begin
+          if (`CORE.u_vecu.vrf[r][64*w +: 64] !== sv) begin
             $display("[cosim] 向量寄存器不一致 (第 %0d 次比对，已提交 %0d 条) v%0d[%0d]: DUT=%h Spike=%h",
-                     n_vchk, n_commit, r, w, `CORE.u_vu.vrf[r][64*w +: 64], sv);
+                     n_vchk, n_commit, r, w, `CORE.u_vecu.vrf[r][64*w +: 64], sv);
             n_err++;
           end
         end
-      if (64'(`CORE.u_vu.vl) != cosim_vcsr(0) || `CORE.u_vu.vtype_rd != cosim_vcsr(1) ||
-          64'(`CORE.u_vu.vstart) != cosim_vcsr(2) || 64'(`CORE.u_vu.vxsat) != cosim_vcsr(3) ||
-          64'(`CORE.u_vu.vxrm) != cosim_vcsr(4)) begin
+      if (64'(`CORE.u_vecu.vl) != cosim_vcsr(0) || `CORE.u_vecu.vtype_rd != cosim_vcsr(1) ||
+          64'(`CORE.u_vecu.vstart) != cosim_vcsr(2) || 64'(`CORE.u_vecu.vxsat) != cosim_vcsr(3) ||
+          64'(`CORE.u_vecu.vxrm) != cosim_vcsr(4)) begin
         $display("[cosim] 向量 CSR 不一致: DUT vl=%0d vtype=%h vstart=%0d vxsat=%0d vxrm=%0d / Spike vl=%0d vtype=%h vstart=%0d vxsat=%0d vxrm=%0d",
-                 `CORE.u_vu.vl, `CORE.u_vu.vtype_rd, `CORE.u_vu.vstart, `CORE.u_vu.vxsat, `CORE.u_vu.vxrm,
+                 `CORE.u_vecu.vl, `CORE.u_vecu.vtype_rd, `CORE.u_vecu.vstart, `CORE.u_vecu.vxsat, `CORE.u_vecu.vxrm,
                  cosim_vcsr(0), cosim_vcsr(1), cosim_vcsr(2), cosim_vcsr(3), cosim_vcsr(4));
         n_err++;
       end
-      // fflags：向量浮点运算的标志由 VU 迟到地并入 CSR；空闲时应与 Spike 一致
-      //   (读的是沿前的值：CSR 里的 + 上一拍提交的 (cmq) + 本拍提交的 + VU 本拍报的)
+      // fflags：向量浮点运算的标志由 VECU 迟到地并入 CSR；空闲时应与 Spike 一致
+      //   (读的是沿前的值：CSR 里的 + 上一拍提交的 (cmq) + 本拍提交的 + VECU 本拍报的)
       begin
         logic [4:0] dff;
-        dff = `CORE.u_csr.fflags | `CORE.cmq_fflags | `CORE.cm_fflags | `CORE.vu_ff;
+        dff = `CORE.u_csr.fflags | `CORE.cmq_fflags | `CORE.cm_fflags | `CORE.vecu_ff;
         if (64'(dff) != cosim_vcsr(5)) begin
           $display("[cosim] fflags 不一致: DUT=%b Spike=%b", dff, 5'(cosim_vcsr(5)));
           n_err++;

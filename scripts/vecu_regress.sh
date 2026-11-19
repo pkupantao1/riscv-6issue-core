@@ -1,8 +1,8 @@
 #!/bin/bash
-# o6_vu 重构用的向量回归 (每改一步 RTL 跑一遍)：单独编 SIMTAG=vx (UVM 检查器开、覆盖率关)，
+# o6_vecu 重构用的向量回归 (每改一步 RTL 跑一遍)：单独编 SIMTAG=vx (UVM 检查器开、覆盖率关)，
 #   1 定向 work/tests/vt/*  2 vgen 随机 N 个 (全部类别，最后 N/4 个混入会出异常的访存)  3 vbench 热测拍数 (性能不退化)
-#   与 Spike 逐条对拍、VU 跑空时整组比对 32 个向量寄存器；结果 work/vx/summary.txt (一行一阶段)
-#   scripts/vu_regress.sh [N，默认 120] [起始种子，默认 9500]
+#   与 Spike 逐条对拍、VECU 跑空时整组比对 32 个向量寄存器；结果 work/vx/summary.txt (一行一阶段)
+#   scripts/vecu_regress.sh [N，默认 120] [起始种子，默认 9500]
 #   环境变量：JOBS (默认 4)、NOBUILD=1、NOBENCH=1、VDEFS="+define+O6_VDLEN=1024" (换 DLEN)、SIMTAG (默认 vx)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 N=${1:-120}
@@ -54,4 +54,4 @@ if [ -z "$NOBENCH" ]; then
   echo "[vbench] $(awk '{printf "%s=%s ", $1, $3}' $R/vbench.txt)" | tee -a $SUM
   grep -v "=== PASS" $R/vbench.txt | sed 's/^/    不过：/' | tee -a $SUM
 fi
-echo VU_REGRESS_DONE | tee -a $SUM
+echo VECU_REGRESS_DONE | tee -a $SUM

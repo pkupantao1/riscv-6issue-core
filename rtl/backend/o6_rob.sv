@@ -37,6 +37,8 @@ module o6_rob
   input  wire  [63:0]      cmpl_x2_i [N_CMPL],   // H：各完成口的 guest page fault GPA (非 LSU 口接 0)
   input  wire  [N_STD-1:0]       std_done_i,
   input  var rob_ptr_t [N_STD-1:0] std_rob_i,
+  input  wire              vsd_done_i,       // M3b：向量 store 数据 uop 的数据半边完成 (VX)
+  input  var rob_ptr_t     vsd_rob_i,
   input  wire              head_start_i,     // 头项的 wait_head 指令已启动
   input  wire              step_i,           // 调试单步：每拍最多提交 1 条
   // 访存违例：给 load 置 replay 位 (到头时不提交，冲刷后从它自己重取)，不改完成状态
@@ -55,6 +57,15 @@ module o6_rob
   output preg_t [W-1:0]    cm_pdst_o,
   output preg_t [W-1:0]    cm_old_pdst_o,
   output logic [W-1:0]     cm_mvel_o,
+  output logic [W-1:0]     cm_vmid_o,        // M3：提交的是展开的指令中间的 uop
+  output logic [W-1:0]     cm_vgl_o,         // M3b：提交的是展开的指令的最后一个 uop (VS 置脏：store 的 uop 不经 VECU 提交口)
+  output logic             ev_vgrp_o,        // M3：事件那项是展开的指令里的 uop
+  output logic [W-1:0]     cmv_f_o,          // O1：提交的乱序向量 uop (目的 = cm_pdst_o) / 不在核内改名的向量写
+  output logic [W-1:0]     cmv_nw_o,
+  output logic [4:0]       cmv_wd_o [W],
+  output logic [3:0]       cmv_wn_o [W],
+  output logic [3:0]       cmv_ng_o [W],     // V1.2b：提交的乱序向量运算的组大小与整组新物理寄存器
+  output preg_t [7:0]      cmv_pg_o [W],
   output logic [W-1:0]     cm_is_ld_o,
   output logic [W-1:0]     cm_is_st_o,
   output logic [W-1:0]     cm_is_br_o,
@@ -87,7 +98,17 @@ module o6_rob
   // 此时第二老的向量指令可以提前发射 (它到 EX 时头已提交)
   output rob_ptr_t         head2_o,
   output logic             head2_go_o,
-  output wire              empty_o
+  output wire              empty_o,
+
+  // I1.3b 提交送 VECU (docs/11 §9d)：提交扫描到 vea 项时，只有 VECU 本拍能收下向量指令队列头 (vacc_i) 才提交它，每拍至多一条
+  //   V5：每拍至多 NVC 条，第 k 条 (本拍扫描到的第 k 个 vea) 看 vacc_i[k] (VECU 按 VDQ 第 k 项给，第 1 条起只能是切换标记)
+  input  wire  [NVC-1:0]   vacc_i,
+  output logic             vreach_o,         // 本拍扫描到一条 vea 项 (之前的都提交)
+  output rob_ptr_t         vreach_rob_o,
+  output logic [2:0]       vcm_o,            // 本拍提交的 vea 条数 (VECU 入队、VDQ 出队)
+  // I2a (docs/11 §9e)：有已提交未做完的异步向量 load 时不陷入、不接中断 (它们按提交时的特权级 / 翻译上下文访存，
+  //   陷入会改上下文)；异常项留在头上等它们做完
+  input  wire              vtrap_blk_i
 );
   localparam int R = ROB_ROWS;
 
@@ -113,6 +134,13 @@ module o6_rob
     fu_e                  fu;
     logic [4:0]           op;
     logic                 mvel;        // 被消除的 move：没有分配新的物理寄存器
+    logic                 vea;         // I1.3b：提交时送 VECU 的向量指令
+    logic                 vf, vnw;     // O1：乱序向量 uop / 不在核内改名的向量写 (提交时更新提交态 VRAT 与在途写计数)
+    logic [4:0]           vwd;
+    logic [3:0]           vwn;
+    logic                 vgrp, vmid, vlast;
+    logic [3:0]           vng;                 // V1.2b：乱序向量运算的组 (vf 时)
+    preg_t [7:0]          vpd;   // M3：展开的指令里的 uop / 不是第一个 / 最后一个
   } rob_ent_t;
 
   rob_ent_t                 ent   [R][W];
@@ -165,7 +193,8 @@ module o6_rob
   // 头项已启动 (CSR / 向量 / MMIO 访问 / AMO —— 只有这几类会给 head_start) 就不接受中断：MMIO load 在地址翻译后才知道是 MMIO，
   //   ROB 项的 wait_head 为 0，原来要求 wait_head 会漏掉它 —— 已读了有副作用的设备 (如 PLIC 认领) 又被中断、返回后重读 (#35)
   wire        head_locked = head_ent.started || head_start_i;
-  wire        take_irq    = irq_pending_i && head_valid && !head_locked && !ev_block_i;
+  // M3：头是展开的指令中间的 uop (前面的已提交) 时不接中断，中断只在指令边界
+  wire        take_irq    = irq_pending_i && head_valid && !head_locked && !ev_block_i && !vtrap_blk_i && !head_ent.vmid;
   assign      head_go_o   = !irq_pending_i && !ev_block_i;
   always_comb begin
     logic found;
@@ -173,8 +202,9 @@ module o6_rob
     head2_o = '{flag: head_flag, row: head_row, col: head_col};
     for (int c = W - 1; c >= 0; c--)
       if (c > int'(head_col) && hvld[c]) begin found = 1'b1; head2_o.col = ROB_COL_W'(c); end
+    // vea 项 (含 I2a 的 vel：FU_VEC、预查完成) 要等 VECU 提交口收下，不算 "已完成的向量指令"
     head2_go_o = found && head_valid && head_ent.fu == FU_VEC && head_ent.done_a && head_ent.done_b &&
-                 !head_ent.excp && !head_ent.flush_after && !head_ent.replay;
+                 !head_ent.excp && !head_ent.flush_after && !head_ent.replay && !head_ent.vea;
   end
 
   logic [W-1:0] commit;
@@ -191,6 +221,9 @@ module o6_rob
     trap_excp  = 1'b0;
     head_replay = 1'b0;
     last_col   = head_col;
+    vreach_o   = 1'b0;
+    vreach_rob_o = '{flag: head_flag, row: head_row, col: head_col};
+    vcm_o      = '0;
     go         = !ev_block_i && !take_irq && !flush_i;
     for (int c = 0; c < W; c++) begin
       if (go && c >= head_col) begin
@@ -199,15 +232,20 @@ module o6_rob
         end else if (!(hent[c].done_a && hent[c].done_b)) begin
           go = 1'b0;
         end else if (hent[c].excp) begin
-          if (c == head_col && !dx_v) trap_excp = 1'b1;    // dx_v：非法指令候选还没并进 ox
+          if (c == head_col && !dx_v && !vtrap_blk_i) trap_excp = 1'b1;    // dx_v：非法指令候选还没并进 ox
           go = 1'b0;
         end else if (hent[c].replay) begin
           if (c == head_col) head_replay = 1'b1;
           go = 1'b0;
+        end else if (hent[c].vea && (vcm_o >= 3'(NVC) || !vacc_i[vcm_o])) begin
+          // 本拍第 NVC + 1 条 vea，或 VECU 收不下这一条 / 头被判为非法 (非法由核经完成口报，下拍陷入)
+          if (!vreach_o) begin vreach_o = 1'b1; vreach_rob_o.col = ROB_COL_W'(c); end
+          go = 1'b0;
         end else begin
           commit[c] = 1'b1;
           last_col  = ROB_COL_W'(c);
-          if (step_i) go = 1'b0;
+          if (hent[c].vea) begin if (!vreach_o) vreach_rob_o.col = ROB_COL_W'(c); vreach_o = 1'b1; vcm_o = vcm_o + 3'd1; end
+          if (step_i && !(hent[c].vgrp && !hent[c].vlast)) go = 1'b0;   // 单步：一条指令 (展开的指令整条) 后停
           if (hent[c].flush_after) begin
             stop_flush = 1'b1;
             go = 1'b0;
@@ -244,6 +282,15 @@ module o6_rob
       cm_pdst_o[c]     = hent[c].pdst;
       cm_old_pdst_o[c] = hent[c].old_pdst;
       cm_mvel_o[c]     = hent[c].mvel;
+      // M3：展开的指令在最后一个 uop 提交时才算一条 (minstret / 对拍)；中途 replay 重做的不会重复计数
+      cm_vmid_o[c]     = commit[c] && hent[c].vgrp && !hent[c].vlast;
+      cm_vgl_o[c]      = commit[c] && hent[c].vgrp && hent[c].vlast;
+      cmv_f_o[c]       = commit[c] && hent[c].vf;
+      cmv_nw_o[c]      = commit[c] && hent[c].vnw;
+      cmv_wd_o[c]      = hent[c].vwd;
+      cmv_wn_o[c]      = hent[c].vwn;
+      cmv_ng_o[c]      = hent[c].vng;
+      cmv_pg_o[c]      = hent[c].vpd;
       cm_is_ld_o[c]    = commit[c] && hent[c].is_ld;
       cm_is_st_o[c]    = commit[c] && hent[c].is_st;
       cm_is_br_o[c]    = commit[c] && hent[c].is_br;
@@ -271,6 +318,7 @@ module o6_rob
     ev_ftq_off_o  = e.ftq_off;
     ev_is_rvc_o   = e.is_rvc;
     ev_fu_o       = e.fu;
+    ev_vgrp_o     = e.vgrp;
     ev_op_o       = e.op;
   end
 
@@ -324,8 +372,18 @@ module o6_rob
         uop_t u;
         u = dis_uop_i[c];
         e = '0;
-        e.done_a      = (u.fu == FU_NONE);      // 译码即异常 / 无需执行 (含被消除的 move)
+        e.done_a      = (u.fu == FU_NONE) && !u.vfast;   // 译码即异常 / 无需执行 (含被消除的 move)；乱序向量 uop 等 VX 完成
         e.mvel        = u.mvel;
+        e.vea         = u.vea;
+        e.vf          = u.vfast && !u.vms;            // M3b：向量 store 数据 uop 不分配向量物理寄存器，提交时不切映射
+        e.vnw         = u.vnw;
+        e.vwd         = u.vwd;
+        e.vwn         = u.vwn;
+        e.vng         = u.vng;
+        e.vpd         = u.vpd;
+        e.vgrp        = u.vgrp;
+        e.vmid        = u.vmid;
+        e.vlast       = u.vlast;
         e.done_b      = (u.fu != FU_ST);
         e.started     = 1'b0;
         e.excp        = u.excp;
@@ -374,6 +432,7 @@ module o6_rob
     end
     for (int k = 0; k < N_STD; k++)
       if (std_done_i[k]) ent[std_rob_i[k].row][std_rob_i[k].col].done_b <= 1'b1;
+    if (vsd_done_i) ent[vsd_rob_i.row][vsd_rob_i.col].done_b <= 1'b1;     // M3b：VX 读出向量 store 数据写进 SQ
     if (head_start_i && head_valid)
       ent[head_row][head_col].started <= 1'b1;
     for (int s = 0; s < N_STA; s++)
@@ -556,7 +615,9 @@ module o6_rob
   always_ff @(posedge clk_i) if (rst_ni && !flush_i) begin
     for (int k = 0; k < N_CMPL; k++)
       if (cmpl_i[k].valid && !(br_upd_i.kill && rob_older(br_upd_i.kill_rob, cmpl_i[k].rob_idx)))
-        assert (!ent[cmpl_i[k].rob_idx.row][cmpl_i[k].rob_idx.col].done_a)
+        // vea 项 (I1.3b) 分派即完成：VECU 判非法时由最后一个完成口补报异常，不算重复完成
+        assert (!ent[cmpl_i[k].rob_idx.row][cmpl_i[k].rob_idx.col].done_a ||
+                (ent[cmpl_i[k].rob_idx.row][cmpl_i[k].rob_idx.col].vea && cmpl_i[k].excp))
           else $error("rob: 完成口 %0d 写入已完成项 row=%0d col=%0d", k, cmpl_i[k].rob_idx.row, cmpl_i[k].rob_idx.col);
   end
 `endif

@@ -42,6 +42,9 @@ module o6_dispatch
   output logic [W-1:0]        sq_alloc_o,
   output uop_t [W-1:0]        lsu_uop_o,      // 与 rob_uop_o 相同，给 LSU 记录表项
 
+  // 向量指令队列 (I1.3b)：空位 >= W (整组都是 vea 也放得下)
+  input  wire                 vdq_ok_i,
+
   // 发射队列
   input  wire  [6:0]          iq_free_i [N_IQ],
   output logic [IQ_ENQ_MAX-1:0] iq_enq_valid_o [N_IQ],
@@ -137,7 +140,7 @@ module o6_dispatch
           FU_LD:   begin has0[s] = 1'b1; iq0[s] = in_need_i.mq[s] ? 3'(IQ_N) : 3'(IQ_M); end
           FU_ST: begin
             has0[s] = 1'b1; iq0[s] = 3'(IQ_S);
-            has1[s] = 1'b1; iq1[s] = (u.rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D);
+            has1[s] = !u.vms; iq1[s] = (u.rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D);   // M3b：向量 store 数据进 VIQ
           end
           FU_AMO: begin
             has0[s] = 1'b1; iq0[s] = 3'(IQ_S);
@@ -147,6 +150,8 @@ module o6_dispatch
                    begin has0[s] = 1'b1; iq0[s] = 3'(IQ_F); end
           default: ;   // FU_NONE：不进队列
         endcase
+        // V1.2c：带标量源的乱序向量候选只有数据半边 (读 x / f[rs1] 送 VIQ)
+        if (u.vxs) begin has1[s] = 1'b1; iq1[s] = (u.rs2_class == RC_FP) ? 3'(IQ_F) : 3'(IQ_D); end
       end
     end
   end
@@ -230,7 +235,7 @@ module o6_dispatch
   end
 
   wire any  = |in_valid_i;
-  wire fire = any && rob_ready_i && iq_ok &&
+  wire fire = any && rob_ready_i && iq_ok && vdq_ok_i &&
               ((LQ_W+1)'(in_need_i.nld) <= lq_free_i) && ((SQ_W+1)'(in_need_i.nst) <= sq_free_i) &&
               !flush_i && !br_upd_i.kill;
 
@@ -247,7 +252,7 @@ module o6_dispatch
           assert (!ref_v[q][k] || iq_enq_uop_o[q][k] == ref_u[q][k]) else $error("o6_dispatch: 入队 uop iq%0d[%0d] 与参考不一致", q, k);
       end
       for (int s = 0; s < W; s++)
-        assert (!in_valid_i[s] || du[s] == rdu[s]) else $error("o6_dispatch: 第 %0d 条 uop (端口 / LQ / SQ 序号) 与参考不一致", s);
+        assert (!in_valid_i[s] || du[s] == rdu[s]) else $error("o6_dispatch: 第 %0d 条 uop (端口 / LQ / SQ 序号) 与参考不一致 (rob %b/%b lq %b/%b sq %b/%b vng %h vpd %h vpg0 %h raw %h)", s, du[s].rob_idx, rdu[s].rob_idx, du[s].lq_idx, rdu[s].lq_idx, du[s].sq_idx, rdu[s].sq_idx, du[s].vng, du[s].vpd, du[s].vpg[0], du[s].raw);
     end
 `endif
 

@@ -390,7 +390,7 @@ module o6_csr
     if (p == PRV_U && !sce[n]) return v ? VIR : ILL;
     return OK;
   endfunction
-  // 有效特权等级：M 3、HS 2、VS 1、U / VU 0 (Spike csr_t::verify_permissions)
+  // 有效特权等级：M 3、HS 2、VS 1、U / VECU 0 (Spike csr_t::verify_permissions)
   wire [1:0] pe = (priv == PRV_M) ? 2'd3 : (priv == PRV_S) ? (virt ? 2'd1 : 2'd2) : 2'd0;
 
   logic [1:0]  chk;
@@ -455,7 +455,7 @@ module o6_csr
           else if (virt)                     chk = (priv == PRV_U || hs_vtw) ? VIR : OK;
           else                               chk = (priv == PRV_U) ? ILL : OK;
         end
-        SYS_WRS: begin                         // Zawrs wrs.nto：TW = 1 时非 M 态非法；V = 1 且 VTW -> virtual (U / VU 在 TW = VTW = 0 时合法)
+        SYS_WRS: begin                         // Zawrs wrs.nto：TW = 1 时非 M 态非法；V = 1 且 VTW -> virtual (U / VECU 在 TW = VTW = 0 时合法)
           raw = 32'h00d0_0073;
           if (st_tw)                         chk = (priv != PRV_M) ? ILL : OK;
           else if (virt && hs_vtw)           chk = VIR;
@@ -465,7 +465,7 @@ module o6_csr
           if (virt)                          chk = (priv == PRV_U || hs_vtvm) ? VIR : OK;
           else                               chk = (priv == PRV_U || (priv == PRV_S && st_tvm)) ? ILL : OK;
         end
-        SYS_INVF: begin                        // Svinval sfence.w.inval / sfence.inval.ir：只要求 S 及以上 (VU -> virtual)
+        SYS_INVF: begin                        // Svinval sfence.w.inval / sfence.inval.ir：只要求 S 及以上 (VECU -> virtual)
           raw = ex_uop_i.raw;
           if (priv == PRV_U)                 chk = virt ? VIR : ILL;
         end
@@ -545,7 +545,7 @@ module o6_csr
     pend = mip & mie;
     // 三组 (先 M 再 HS 再 VS，前一组有就不看后一组)：
     //   M：未委托，priv < M 或 MIE；HS：mideleg 且非 hideleg，V = 1 或 U 或 (HS 且 SIE)，M 态不取；
-    //   VS：hideleg，仅 V = 1，且 VU 或 (VS 且 vsstatus.SIE)
+    //   VS：hideleg，仅 V = 1，且 VECU 或 (VS 且 vsstatus.SIE)
     m_en = pend & ~mideleg_rd & {64{(priv != PRV_M) || st_mie}};
     h_en = pend &  mideleg_rd & ~hideleg & {64{virt || (priv == PRV_U) || (priv == PRV_S && st_sie)}};
     v_en = pend &  hideleg & {64{virt && ((priv == PRV_U) || (priv == PRV_S && vs_sie))}};
@@ -617,7 +617,7 @@ module o6_csr
     dctx_o.mxr  = st_mxr | (dvv & vs_mxr);
     dctx_o.vam  = da[61:60];
     dctx_o.zx   = (dpv == PRV_M) || !da[63];
-    // 指针掩码 (Spike get_pmlen)：M 不掩 (无 Smmpm)；MXR 不掩；HS 用 menvcfg，VS 用 henvcfg，U / VU 用 senvcfg
+    // 指针掩码 (Spike get_pmlen)：M 不掩 (无 Smmpm)；MXR 不掩；HS 用 menvcfg，VS 用 henvcfg，U / VECU 用 senvcfg
     if (dpv == PRV_M || st_mxr || (dvv && vs_mxr)) dctx_o.pmm = 2'b00;
     else if (dpv == PRV_S)                         dctx_o.pmm = dvv ? henvcfg_pmm : menvcfg_pmm;
     else                                           dctx_o.pmm = senvcfg_pmm;
@@ -982,7 +982,7 @@ module o6_csr
   assign pbmte_o  = menvcfg_pbmte;
   assign vpbmte_o = menvcfg_pbmte & henvcfg_pbmte;
   // 与 Spike 的 require_envcfg 一致：M 态总可执行；否则 menvcfg 位 = 0 -> 非法；V = 0 的 U 态 senvcfg 位 = 0 -> 非法；
-  // V = 1 时 henvcfg 位 = 0 或 (VU 且 senvcfg 位 = 0) -> virtual
+  // V = 1 时 henvcfg 位 = 0 或 (VECU 且 senvcfg 位 = 0) -> virtual
   always_comb begin
     logic [2:0] me, se, he;
     me = {menvcfg_cbze, menvcfg_cbcfe, menvcfg_cbie != 2'b00};

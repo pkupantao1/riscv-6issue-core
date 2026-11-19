@@ -1,10 +1,10 @@
-// tb_vu_alu：o6_vu_alu (合并运算器的写法) 与 o6_vu_alu_ref (原写法) 锁步比对，四种宽度同时跑
+// tb_vecu_alu：o6_vecu_alu (合并运算器的写法) 与 o6_vecu_alu_ref (原写法) 锁步比对，四种宽度同时跑
 //   W = 8：全部操作码 x vxrm 4 种 x cin 2 种 x a、b 全空间 (c 随机)；W = 16 / 32 / 64：随机 N 组，操作数偏向边界值
 //   (0、1、全 1、最小负数、最大正数、最小负数 + 1、小移位量)；比较 {饱和, 掩码位, 结果} 三个输出
 //   plusargs：+n=<每种宽度的随机组数，默认 3000000>
 `timescale 1ns/1ps
-module tb_vu_alu;
-  import o6_vu_pkg::*;
+module tb_vecu_alu;
+  import o6_vecu_pkg::*;
   int nerr = 0;
   int done = 0;
   longint nchk = 0;
@@ -19,8 +19,8 @@ module tb_vu_alu;
     logic [1:0]   xrm;
     logic [W-1:0] r0, r1;
     logic         m0, m1, s0, s1;
-    o6_vu_alu     #(.W(W)) u_dut (.op_i(op), .a_i(a), .b_i(b), .c_i(c), .cin_i(cin), .xrm_i(xrm), .r_o(r0), .m_o(m0), .s_o(s0));
-    o6_vu_alu_ref #(.W(W)) u_ref (.op_i(op), .a_i(a), .b_i(b), .c_i(c), .cin_i(cin), .xrm_i(xrm), .r_o(r1), .m_o(m1), .s_o(s1));
+    o6_vecu_alu     #(.W(W)) u_dut (.op_i(op), .a_i(a), .b_i(b), .c_i(c), .cin_i(cin), .xrm_i(xrm), .r_o(r0), .m_o(m0), .s_o(s0));
+    o6_vecu_alu_ref #(.W(W)) u_ref (.op_i(op), .a_i(a), .b_i(b), .c_i(c), .cin_i(cin), .xrm_i(xrm), .r_o(r1), .m_o(m1), .s_o(s1));
 
     function automatic logic [W-1:0] pick();
       logic [W-1:0] v;

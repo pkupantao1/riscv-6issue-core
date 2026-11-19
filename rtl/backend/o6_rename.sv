@@ -46,7 +46,26 @@ module o6_rename
   input  wire  [4:0]       cm_lrd_i [W],
   input  var preg_t [W-1:0]    cm_pdst_i,
   input  var preg_t [W-1:0]    cm_old_pdst_i,
-  input  wire  [W-1:0]     cm_mvel_i        // 提交的是被消除的 move (没有分配新的物理寄存器)
+  input  wire  [W-1:0]     cm_mvel_i,       // 提交的是被消除的 move (没有分配新的物理寄存器)
+
+  // O1 核内向量乱序 (docs/11 §9f)
+  input  wire  [31:0]      vwpend_i,        // VECU：已提交、还没做完的 "不在核内改名的写" 的寄存器 (组合)
+  input  wire  [W-1:0]     vfr_v_i,         // VECU：回收到核内池的向量物理寄存器 (映射切换后旧的)
+  input  var preg_t [W-1:0] vfr_p_i,
+  input  wire  [NVX-1:0]   vxw_v_i,         // VX 写回 (清忙)，V3：每个执行器一个
+  input  var preg_t        vxw_p_i [NVX],
+  input  wire  [N_LDP-1:0] vlw_v_i,         // M3：向量 load 写完 (清忙)
+  input  var preg_t [N_LDP-1:0] vlw_p_i,
+  output logic [N_VPREG-1:0] vbusy_o,       // 向量物理寄存器忙 (VIQ 选择用)
+  output logic [31:0]      vpend_o,         // M3：各寄存器有在途的不在核内改名的写 (寄存一拍，给译码级决定展不展开)
+  input  wire  [W-1:0]     cmv_f_i,         // 提交 (cmq，与 cm_* 同拍)：乱序 uop / 不在核内改名的写
+  input  wire  [W-1:0]     cmv_nw_i,
+  input  wire  [4:0]       cmv_wd_i [W],
+  input  wire  [3:0]       cmv_wn_i [W],
+  input  var preg_t [W-1:0] cmv_pd_i,
+  // V1.2b：提交的乱序向量运算的整组 {组大小, 各寄存器的新物理寄存器}
+  input  wire  [3:0]       cmv_ng_i [W],
+  input  var preg_t [7:0]  cmv_pg_i [W]
 );
   localparam int IFL_W = $clog2(N_IPREG);
   localparam int FFL_W = $clog2(N_FPREG);
@@ -54,24 +73,33 @@ module o6_rename
   //--------------------------------------------------------------------------
   // 组内分类
   //--------------------------------------------------------------------------
-  logic [W-1:0] need_i, need_f, is_br;
+  logic [W-1:0] need_i, need_f, need_v, is_br;
   logic [W-1:0] elim, alloc_i; // 被消除的 move (写 RAT、不分配) / 要从整数 free list 分配的
   logic [2:0]   ipos [W];      // 槽 i 之前有几个整数分配
   logic [2:0]   fpos [W];
+  logic [3:0]   vpos [W];      // V1.2b：槽 s 之前分配了几个向量物理寄存器 (按组大小计)
   logic [2:0]   n_i, n_f, n_br;
+  logic [3:0]   n_v;           // 本组分配的向量物理寄存器数 (<= 8，译码已截组)
+  logic [3:0]   vng_s [W];     // 各槽要分配的向量物理寄存器数
+  logic [W-1:0] v_f, v_nw;     // O1：本组各槽定为乱序 / 是不在核内改名的向量写 (见向量重命名)
+  logic [W-1:0] v_s;           // M3b：向量 store 数据 uop (进 VIQ 读寄存器，不分配目的)
+  logic         v_stall;       // M3：本组有向量 load 数据 uop 碰到在途写，停住
   always_comb begin
     logic [2:0] ci, cf, cb;
-    ci = '0; cf = '0; cb = '0;
+    logic [3:0] cv;
+    ci = '0; cf = '0; cv = '0; cb = '0;
     for (int s = 0; s < W; s++) begin
       need_i[s] = in_valid_i[s] && in_uop_i[s].rd_class == RC_INT;
       need_f[s] = in_valid_i[s] && in_uop_i[s].rd_class == RC_FP;
+      need_v[s] = v_f[s];
+      vng_s[s]  = v_f[s] ? in_uop_i[s].vng : 4'd0;
       elim[s]   = need_i[s] && in_uop_i[s].mvel;
       alloc_i[s] = need_i[s] && !in_uop_i[s].mvel;
       is_br[s]  = in_valid_i[s] && in_uop_i[s].is_br;
-      ipos[s] = ci; fpos[s] = cf;
-      ci += alloc_i[s]; cf += need_f[s]; cb += is_br[s];
+      ipos[s] = ci; fpos[s] = cf; vpos[s] = cv;
+      ci += alloc_i[s]; cf += need_f[s]; cv += vng_s[s]; cb += is_br[s];
     end
-    n_i = ci; n_f = cf; n_br = cb;
+    n_i = ci; n_f = cf; n_v = cv; n_br = cb;
   end
 
   //--------------------------------------------------------------------------
@@ -83,6 +111,11 @@ module o6_rename
   logic [W:0]                   ifl_ge, ffl_ge;   // 空闲数 >= k (寄存的温度计码，见 o6_freelist)
   logic [IFL_W:0] ifl_head;
   logic [FFL_W:0] ffl_head;
+  // 向量空闲表 (docs/11 §9a)：不进 RAT (I1.2 快路径在 ROB 头按提交态映射读源)，只按程序序分配、按分支快照 / 冲刷恢复
+  localparam int VFL_W = $clog2(VCP);
+  logic [8:0]     vfl_ge;                // V1.2b：向量空闲表每拍至多出队 8 个
+  logic [VFL_W:0] vfl_head, vfl_ahead;
+  logic [VFL_W:0] snap_vhead [MAX_BR];
 
   // 分支标签
   br_mask_t br_busy;
@@ -121,7 +154,8 @@ module o6_rename
 
   wire tags_ok  = (n_br == 0) || (n_br == 1 && tag_ok[0]) || (n_br == 2 && tag_ok[0] && tag_ok[1]);
   // 空闲数够不够：按 n_i / n_f 取寄存温度计码的一位 (2026-10-28，6 GHz：原 "tail - head -> 比较" 在 fire 前，b160 −25)
-  wire res_ok   = ifl_ge[n_i] && ffl_ge[n_f] && tags_ok && (n_br <= MAX_BR_PER_GRP);   // n_i 不含被消除的 move
+  wire res_ok   = ifl_ge[n_i] && ffl_ge[n_f] && vfl_ge[n_v] && tags_ok && (n_br <= MAX_BR_PER_GRP) &&   // n_i 不含被消除的 move
+                  !v_stall;
   // 输出是 2 组队列 (q0 = out_*，q1 在下面)：能否重命名只看寄存的"q1 空"，
   // 不等分派级当拍的就绪 (端口分配 + IQ/ROB/LSQ 空位比较的深逻辑)
   logic [W-1:0] q1_v;
@@ -352,6 +386,203 @@ module o6_rename
   );
 
   //--------------------------------------------------------------------------
+  // O1 核内向量重命名 (docs/11 §9f)
+  //   空闲表：核内池 [0, VCP)，复位映射 v0..v31 -> p0..p31。乱序 uop (vfast) 按程序序分配一个；提交时 arch_head 前进；
+  //     旧映射不在提交时回收 (更老的、提交后才在 VECU 里执行的指令可能还要读)，由 VECU 按序切换映射后经 vfr 送回。
+  //   VRAT：vr_f[r] = 1 表示 vr_p[r] 是核内改名的生产者 (乱序 uop) 的物理寄存器；= 0 表示最近写 r 的是不在核内改名的指令
+  //     (提交后在 VECU 里按序做，原地写 crat 或在 VECU 里改名)，读 r 要按 VECU 的 crat。分支快照 / 提交态 (冲刷恢复) 同整数 RAT。
+  //   在途写：不在核内改名的写 (vnw) 按架构寄存器计数 ta (重命名，随分支快照恢复) / tc (提交)；ta != tc 或 VECU 报的
+  //     vwpend (已提交未做完) 时该寄存器 "有在途写"。乱序候选读写的寄存器 (vs2 / vs1 / vd / v0) 有在途写时降级为 vea。
+  //     所以乱序 uop 读 crat 时，最近写那个寄存器的指令一定已在 VECU 里做完 (映射与数据都已落定)
+  //--------------------------------------------------------------------------
+  preg_t [7:0]   vfl_cand;
+  logic  [$clog2(VCP+1)-1:0] vfl_cnt;
+  preg_t [W-1:0] vfr_preg;
+  logic  [W-1:0] vfr_vld;
+  logic  [5:0]   cmv_nf;                                // 本拍提交的乱序 uop 分配过的向量物理寄存器数 (V1.2b：按组)
+  always_comb begin
+    vfr_preg = '0; vfr_vld = '0;
+    vfr_preg = vfr_p_i; vfr_vld = vfr_v_i;                // V3：W 个
+    cmv_nf = '0;
+    for (int s = 0; s < W; s++) if (cmv_f_i[s]) cmv_nf += 6'(cmv_ng_i[s]);
+  end
+  o6_freelist #(.N(VCP), .NARCH(32), .FULL_OK(1), .DQ(8)) u_vfl (
+    .clk_i, .rst_ni,
+    .deq_preg_o(vfl_cand), .free_cnt_o(vfl_cnt), .free_ge_o(vfl_ge),
+    .deq_fire_i(fire), .deq_cnt_i(n_v),
+    .head_o(vfl_head), .arch_head_o(vfl_ahead), .arch_preg_o(),
+    .restore_i(br_upd_i.kill), .restore_head_i(snap_vhead[br_upd_i.kill_tag]),
+    .free_vld_i(vfr_vld), .free_preg_i(vfr_preg),
+    .commit_alloc_cnt_i(cmv_nf), .flush_i
+  );
+
+  localparam int TW = 9;                                // 在途写计数位宽 (ROB 项数 < 512)
+  logic          vr_f  [32];  preg_t vr_p  [32];        // 推测态 VRAT
+  logic          cvr_f [32];  preg_t cvr_p [32];        // 提交态
+  logic [TW-1:0] ta [32], tc [32];
+  logic          vs_f [MAX_BR][32];  preg_t vs_p [MAX_BR][32];
+  logic [TW-1:0] tas  [MAX_BR][32];
+  logic [N_VPREG-1:0] vbusy;
+  assign vbusy_o = vbusy;
+
+  function automatic logic [31:0] vgrp(input logic [4:0] d, input logic [3:0] n);
+    return 32'(((64'(1) << n) - 64'(1)) << d);
+  endfunction
+
+  // 逐槽：定乱序 / 在途写，源描述，组内各槽之后的 VRAT / 计数 (快照用)
+  vsrc_t [3:0]   v_src [W];
+  vsrc_t [2:0][7:0] v_sg [W];                            // V1.2b：源 0..2 的整组映射
+  preg_t [7:0]   v_pg  [W];                              // V1.2b：目的组新分配的物理寄存器
+  preg_t         v_pd  [W];
+  logic          va_f [W][32];  preg_t va_p [W][32];    // 槽 0..s 处理之后的 VRAT
+  logic [TW-1:0] va_t [W][32];                          // 槽 0..s 处理之后的 ta
+  always_comb begin
+    logic          cf [32]; preg_t cp [32];
+    logic [TW-1:0] ct [32];
+    logic [31:0]   pend;
+    v_stall = 1'b0;
+    for (int r = 0; r < 32; r++) begin
+      cf[r] = vr_f[r]; cp[r] = vr_p[r]; ct[r] = ta[r];
+    end
+    for (int s = 0; s < W; s++) begin
+      uop_t        u;
+      logic [4:0]  ar [4];
+      logic [3:0]  au;
+      logic        tnt;
+      logic [2:0]  vp;
+      u = in_uop_i[s];
+      // 当前 (含本组更早的槽) 的在途写
+      for (int r = 0; r < 32; r++) pend[r] = (ct[r] != tc[r]) || vwpend_i[r];
+      ar[0] = u.raw[24:20]; ar[1] = u.raw[19:15]; ar[2] = u.raw[11:7]; ar[3] = 5'd0;
+      // vps 下标：[0] vs2，[1] vs1 (只有 .vv：OPIVV / V1.2a 起 OPFVV)，[2] vd 旧值 (尾部 / 被掩掉的元素保持；乘加的累加源)，[3] v0 (带掩码)
+      au    = {!u.raw[25], 1'b1, u.raw[14:12] == 3'b000 || u.raw[14:12] == 3'b001, 1'b1};
+      // M3 向量 load 数据 uop：只有 [2] = 寄存器 vwd 的旧值 (有效字节不满一行时补尾部)
+      // M4a：带掩码时 [3] = v0 (掩码)，load 的 [2] 一定要 (被掩掉的字节保持旧值)
+      if (u.vml) begin ar[2] = u.vwd; au = {u.vmk, u.vnb < 8'(CL_B) || u.vmk, 1'b0, 1'b0}; end
+      // M3b 向量 store 数据 uop：只有 [2] = 寄存器 vwd 的当前值 (要写进 SQ 的数据)
+      if (u.vms) begin ar[2] = u.vwd; au = {u.vmk, 3'b100}; end
+      tnt   = 1'b0;
+      for (int k = 0; k < 3; k++)
+        for (int j = 0; j < 8; j++) if (au[k] && j < int'((k < 2) ? u.vns : u.vng) && pend[ar[k] + 5'(j)]) tnt = 1'b1;   // V4：源组 vns 个
+      if (au[3] && pend[ar[3]]) tnt = 1'b1;
+      // M3：已经展开的 uop 不能降级 -> 目的 (store：数据源) 有在途写时本组停住 (等那条在 VECU 里做完)
+      if (in_valid_i[s] && u.vml && (tnt || pend[u.vwd])) v_stall = 1'b1;
+      if (in_valid_i[s] && u.vms && tnt) v_stall = 1'b1;
+      v_f[s]  = in_valid_i[s] && ((u.vfc && !tnt) || u.vml);
+      v_s[s]  = in_valid_i[s] && u.vms;
+      v_nw[s] = in_valid_i[s] && u.vnw && !v_f[s];
+      // V1.2b：目的组 (vng 个) 依次取空闲表的候选；源 0..2 按组查映射 (组内各寄存器)，v0 只有一个
+      for (int j = 0; j < 8; j++) begin
+        logic [2:0] ix;
+        ix = vpos[s][2:0] + 3'(j);
+        v_pg[s][j] = vfl_cand[ix];
+      end
+      v_pd[s] = v_pg[s][0];
+      for (int k = 0; k < 3; k++)
+        for (int j = 0; j < 8; j++) begin
+          logic [4:0] r;
+          r = ar[k] + 5'(j);
+          v_sg[s][k][j].use_ = au[k] && (j < int'((k < 2) ? u.vns : u.vng)) &&
+                               !(k == 2 && u.vnod && !u.vml && !u.vms);   // V3：不读 vd 旧值 (在途写检查照旧算 vd)
+          v_sg[s][k][j].ar   = r;
+          v_sg[s][k][j].cr   = !cf[r];
+          v_sg[s][k][j].p    = cp[r];
+        end
+      for (int k = 0; k < 3; k++) v_src[s][k] = v_sg[s][k][0];
+      v_src[s][3].use_ = au[3]; v_src[s][3].ar = ar[3]; v_src[s][3].cr = !cf[ar[3]]; v_src[s][3].p = cp[ar[3]];
+      // 本槽的写 (整组)
+      if (v_f[s])
+        for (int j = 0; j < 8; j++)
+          if (j < int'(u.vng)) begin cf[u.vwd + 5'(j)] = 1'b1; cp[u.vwd + 5'(j)] = v_pg[s][j]; end
+      if (v_nw[s]) begin
+        logic [31:0] g;
+        g = vgrp(u.vwd, u.vwn);
+        for (int r = 0; r < 32; r++)
+          if (g[r]) begin cf[r] = 1'b0; ct[r] = ct[r] + 1'b1; end
+      end
+      for (int r = 0; r < 32; r++) begin va_f[s][r] = cf[r]; va_p[s][r] = cp[r]; va_t[s][r] = ct[r]; end
+    end
+  end
+
+  // 提交态的下一值 (冲刷恢复用含本拍提交的)
+  logic          cvr_fn [32]; preg_t cvr_pn [32];
+  logic [TW-1:0] tc_n [32];
+  always_comb begin
+    for (int r = 0; r < 32; r++) begin cvr_fn[r] = cvr_f[r]; cvr_pn[r] = cvr_p[r]; tc_n[r] = tc[r]; end
+    for (int s = 0; s < W; s++) begin
+      if (cmv_f_i[s])
+        for (int j = 0; j < 8; j++)
+          if (j < int'(cmv_ng_i[s])) begin cvr_fn[cmv_wd_i[s] + 5'(j)] = 1'b1; cvr_pn[cmv_wd_i[s] + 5'(j)] = cmv_pg_i[s][j]; end
+      if (cmv_nw_i[s]) begin
+        logic [31:0] g;
+        g = vgrp(cmv_wd_i[s], cmv_wn_i[s]);
+        for (int r = 0; r < 32; r++)
+          if (g[r]) begin cvr_fn[r] = 1'b0; tc_n[r] = tc_n[r] + 1'b1; end
+      end
+    end
+  end
+
+  always_ff @(posedge clk_i or negedge rst_ni) begin
+    if (!rst_ni) begin
+      for (int r = 0; r < 32; r++) begin
+        vr_f[r] <= 1'b1; vr_p[r] <= preg_t'(r); cvr_f[r] <= 1'b1; cvr_p[r] <= preg_t'(r);
+        ta[r] <= '0; tc[r] <= '0;
+      end
+      vbusy <= '0;
+    end else begin
+      for (int r = 0; r < 32; r++) begin cvr_f[r] <= cvr_fn[r]; cvr_p[r] <= cvr_pn[r]; tc[r] <= tc_n[r]; end
+      if (flush_i) begin
+        for (int r = 0; r < 32; r++) begin vr_f[r] <= cvr_fn[r]; vr_p[r] <= cvr_pn[r]; ta[r] <= tc_n[r]; end
+      end else if (br_upd_i.kill) begin
+        for (int r = 0; r < 32; r++) begin
+          vr_f[r] <= vs_f[br_upd_i.kill_tag][r]; vr_p[r] <= vs_p[br_upd_i.kill_tag][r]; ta[r] <= tas[br_upd_i.kill_tag][r];
+        end
+      end else if (fire) begin
+        for (int r = 0; r < 32; r++) begin vr_f[r] <= va_f[W-1][r]; vr_p[r] <= va_p[W-1][r]; ta[r] <= va_t[W-1][r]; end
+      end
+      // 忙：乱序 uop 的目的分配时置、VX 写回时清；冲刷时全清 (在途的都作废)
+      if (flush_i) vbusy <= '0;
+      else begin
+        logic [N_VPREG-1:0] b;
+        b = vbusy;
+        for (int x = 0; x < NVX; x++) if (vxw_v_i[x]) b[vxw_p_i[x]] = 1'b0;   // V3：各执行器
+        for (int k = 0; k < N_LDP; k++) if (vlw_v_i[k]) b[vlw_p_i[k]] = 1'b0;
+        if (fire) for (int s = 0; s < W; s++) if (v_f[s]) for (int j = 0; j < 8; j++) if (j < int'(in_uop_i[s].vng)) b[v_pg[s][j]] = 1'b1;
+        vbusy <= b;
+      end
+    end
+  end
+  // M3：在途写给译码级 (只是选路径的提示：过时了也只影响快慢，展开的 uop 到重命名还会再查、必要时停住)
+  always_ff @(posedge clk_i or negedge rst_ni)
+    if (!rst_ni) vpend_o <= '0;
+    else for (int r = 0; r < 32; r++) vpend_o[r] <= (ta[r] != tc[r]) || vwpend_i[r];
+  // 分支快照：分支所在槽 s 之后的 VRAT / ta
+  always_ff @(posedge clk_i)
+    if (fire)
+      for (int s = 0; s < W; s++)
+        if (is_br[s])
+          for (int r = 0; r < 32; r++) begin
+            vs_f[slot_tag[s]][r] <= va_f[s][r]; vs_p[slot_tag[s]][r] <= va_p[s][r]; tas[slot_tag[s]][r] <= va_t[s][r];
+          end
+`ifndef SYNTHESIS
+  always_ff @(posedge clk_i)
+    if (rst_ni) begin
+      for (int s = 0; s < W; s++)
+        // V1.2b：分到的目的组不能有 X (VCS 2018 下 `vfl_cand[3'(int 表达式)]` 曾给出 X，改成显式 3 位加法)
+        if (fire && v_f[s])
+          assert (!$isunknown(v_pg[s])) else $error("rename: 槽 %0d 目的组 %h 有 X (候选 %h)", s, v_pg[s], vfl_cand);
+      for (int s = 0; s < W; s++)
+        if (fire && v_f[s]) begin
+          // (被误预测作废的乱序 uop 的目的不清忙：重新分配时照样置忙，无妨)
+          assert (v_pd[s] < preg_t'(VCP)) else $error("rename: 乱序 uop 分到的 p%0d 不在核内池", v_pd[s]);
+          assert (in_uop_i[s].rd_class == RC_NONE) else $error("rename: 乱序 uop 带标量目的");
+        end
+      for (int k = 0; k < W; k++)
+        if (vfr_v_i[k]) assert (vfr_p_i[k] < preg_t'(VCP) && vfr_p_i[k] >= preg_t'(0)) else $error("rename: VECU 回收的 p%0d 不在核内池", vfr_p_i[k]);
+    end
+`endif
+
+  //--------------------------------------------------------------------------
   // busy 表
   //--------------------------------------------------------------------------
   logic [N_IWAKE-1:0] iclr_en;  preg_t [N_IWAKE-1:0] iclr_p;
@@ -438,6 +669,11 @@ module o6_rename
       u.psrc3 = ps[2]; u.src3_busy = bz[2];
       u.pdst     = (u.rd_class == RC_NONE) ? '0 : new_pdst[s];
       u.old_pdst = (u.rd_class == RC_NONE) ? '0 : old;
+      // O1：乱序向量 uop (目的 = 向量物理寄存器，借 pdst 字段；rd_class 是 RC_NONE，整数 / 浮点路径不看它)
+      u.vfast = v_f[s] || v_s[s];
+      u.vnw   = v_nw[s];
+      if (v_f[s]) begin u.pdst = v_pd[s]; u.vps = v_src[s]; u.vpg = v_sg[s]; u.vpd = v_pg[s]; end
+      if (v_s[s]) u.vps = v_src[s];
 
       // 分支掩码
       u.br_mask = br_busy_now;
@@ -513,6 +749,7 @@ module o6_rename
         if (is_br[s]) begin
           snap_ihead[slot_tag[s]] <= fl_add_i(ifl_head, ipos[s] + 3'(alloc_i[s]));
           snap_fhead[slot_tag[s]] <= fl_add_f(ffl_head, fpos[s] + 3'(need_f[s]));
+          snap_vhead[slot_tag[s]] <= fl_add_v(vfl_head, vpos[s] + vng_s[s]);
         end
       end
     end
@@ -529,6 +766,12 @@ module o6_rename
     s = {1'b0, p[FFL_W-1:0]} + k;
     if (s >= N_FPREG) return {~p[FFL_W], FFL_W'(s - N_FPREG)};
     else              return {p[FFL_W], s[FFL_W-1:0]};
+  endfunction
+  function automatic logic [VFL_W:0] fl_add_v(input logic [VFL_W:0] p, input logic [3:0] k);
+    logic [VFL_W:0] s;
+    s = {1'b0, p[VFL_W-1:0]} + k;
+    if (s >= VCP) return {~p[VFL_W], VFL_W'(s - VCP)};          // O1：向量空闲表只管核内池
+    else              return {p[VFL_W], s[VFL_W-1:0]};
   endfunction
 
   //--------------------------------------------------------------------------

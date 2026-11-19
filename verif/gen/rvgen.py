@@ -25,7 +25,7 @@
         另有一个 PPN 不对齐的 2 MB 超级页 (必缺页)；主体里随机改写探测页 PTE (随后 sfence.vma)、切换 SUM / MXR；
         PMP 前 1~4 项随机落在探测缓冲区 (TOR / NAPOT x 合法权限，粒度 64 B)，第 7 项放行全部。页表本身不受随机 PMP 覆盖。
         出错的访存由 M 态陷入处理跳过 (mepc += 指令长度)，缺页 / 访问错误与 Spike 对拍
-  --hyp H 扩展 (RVA23 R5a)：M 态开场随机选主体模式 HS / VS / VU / U (mret，MPV / MPP)，随机 medeleg / hedeleg /
+  --hyp H 扩展 (RVA23 R5a)：M 态开场随机选主体模式 HS / VS / VECU / U (mret，MPV / MPP)，随机 medeleg / hedeleg /
         hstatus (VTW / VTVM / HU / SPVP / VTSR)、hcounteren / scounteren、henvcfg；vsatp = Bare；hgatp 随机 (Bare / Sv39x4 / 48x4 / 57x4：
         DRAM 恒等 1 GB 叶子 + GPA 0x1_0000_0000 起 8 个 4 KB 的 G 探测页，G-PTE 属性随机 -> guest page fault)；
         三套陷入处理：M (mepc)、HS 与 VS 共用一段 (V = 1 时 sepc 即 vsepc)，都是跳过出错指令；不开中断使能。
@@ -34,7 +34,7 @@
         G 探测 (普通访存 / HLV / HSV 打 G 探测页)
   --hyp --vm  两级翻译：主体在 VS 态，vsatp 用 --vm 的页表 (satp 那套改写 vsatp)，hgatp 同上 (非 Bare)；VS 探测页之外再有
         VA PVA + 128 KB 起 8 页 -> G 探测页，VA 0x1_0000_0000 的 VS 页表页落在 G 探测页 8 上 (G 属性随机：隐式 guest page fault)；
-        陷入都到 M；不发 H CSR 写与 sret (VS 页表的代码页 U = 0，进 VU 会卡死)
+        陷入都到 M；不发 H CSR 写与 sret (VS 页表的代码页 U = 0，进 VECU 会卡死)
   浮点寄存器全部可写；初值来自含特殊值 (±0/±inf/NaN/非规格化/未 NaN-box) 的数据区。
 用法：
   rvgen.py --seed 1 --n 2000 -o test.S [--fp]   (as 需 -march=rv64gc)
@@ -360,7 +360,7 @@ class Gen:
         elif getattr(self, "hvm", False):
             self.emit("sfence.vma")                            # 两级 (VS 页表) 时不发 sret
         else:
-            # sret 到下一条：HS 里按 sstatus.SPP / hstatus.SPV 换模式，VS 里按 vsstatus.SPP；U / VU 里陷入 (跳过)
+            # sret 到下一条：HS 里按 sstatus.SPP / hstatus.SPV 换模式，VS 里按 vsstatus.SPP；U / VECU 里陷入 (跳过)
             self.emit("la t5, 1f")
             self.emit("csrw sepc, t5")
             self.emit("sret")
@@ -967,7 +967,7 @@ def hyp_prologue(r, init, finit, fp, gmode=0):
     """--hyp 的 M 态开场：PMP 全开、随机委托 / hstatus / 计数器使能，mret 进主体模式。返回 (代码, 主体模式, vtsr)"""
     L = []
     e = L.append
-    mode = r.choice(["HS", "HS", "VS", "VS", "VU", "U"])
+    mode = r.choice(["HS", "HS", "VS", "VS", "VECU", "U"])
     vtsr = r.random() < 0.2
     e("    la    t5, trap_handler")
     e("    csrw  mtvec, t5")
@@ -1011,7 +1011,7 @@ def hyp_prologue(r, init, finit, fp, gmode=0):
         e("    csrs  0x200, t5")                           # vsstatus.FS = Initial (否则 VS 里浮点非法)
     e(init)
     # 进主体：MPP / MPV
-    mpp, mpv = {"HS": (1, 0), "VS": (1, 1), "VU": (0, 1), "U": (0, 0)}[mode]
+    mpp, mpv = {"HS": (1, 0), "VS": (1, 1), "VECU": (0, 1), "U": (0, 0)}[mode]
     e("    la    t5, body")
     e("    csrw  mepc, t5")
     e("    li    t5, 3 << 11")
@@ -1117,7 +1117,7 @@ def main():
     ap.add_argument("--fp", action="store_true", help="加入浮点类别")
     ap.add_argument("--csr", action="store_true", help="加入 CSR 随机访问类别")
     ap.add_argument("--vm", action="store_true", help="主体在 S 态 Sv39 下跑：随机页表 + 随机 PMP")
-    ap.add_argument("--hyp", action="store_true", help="H 扩展：主体在 HS / VS / VU / U 下跑 (随机委托)，加 H 指令 / CSR (as 需 _h)")
+    ap.add_argument("--hyp", action="store_true", help="H 扩展：主体在 HS / VS / VECU / U 下跑 (随机委托)，加 H 指令 / CSR (as 需 _h)")
     ap.add_argument("--rva23", action="store_true", help="加入 RVA23 新增指令 (Zicond / Zimop / Zawrs / Zcb / Zcmop；as 需对应 -march)")
     a = ap.parse_args()
     w = dict(DEFAULT_W)
